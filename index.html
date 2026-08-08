@@ -88,7 +88,7 @@ const { useState, useEffect, useMemo } = React;
    ・管理者：パスワードで入り、履歴の閲覧と「未払い／支払い済」管理
    ============================================================ */
 
-const APP_VERSION = "Ver1-002";
+const APP_VERSION = "Ver1-003";
 
 /* ------------------------------------------------------------
    ★ 管理者パスワードの初期値（マスター管理画面から変更できます）
@@ -109,7 +109,24 @@ const FIREBASE_CONFIG = {
   appId:             "1:245544696406:web:a08ba67808c73762eb19f7",
 };
 
-const COL = { invoices: "bni_invoices", masters: "bni_masters" };
+/* ------------------------------------------------------------
+   Firestore の入れ物
+   ・請求書／マスターの各項目は「1件＝1ドキュメント」で保存する。
+     こうしておくと、複数の人が同時に別々のものを触っても
+     お互いを上書きして消してしまうことがない。
+   ・bni_masters は設定（settings）専用。
+     旧バージョンでは members/trainings/regions も配列で入れていたが、
+     起動時に自動で新しい入れ物へ引っ越す（migrateMasters）。
+   ------------------------------------------------------------ */
+const COL = {
+  invoices:  "bni_invoices",
+  masters:   "bni_masters",   // settings のみ
+  counters:  "bni_counters",  // 請求書番号の採番カウンター
+  members:   "bni_members",
+  trainings: "bni_trainings",
+  regions:   "bni_regions",
+};
+const MASTER_KEYS = ["members", "trainings", "regions"];
 
 const loadFirebase = (() => {
   let promise = null;
@@ -199,15 +216,68 @@ function periodOf(items) {
   const ds = (items || []).map((i) => i.date).filter(Boolean).sort();
   return ds.length ? { from: ds[0], to: ds[ds.length - 1] } : { from: "", to: "" };
 }
-function makeDocNumber(invoices, dateStr) {
-  const prefix = "BNI-" + String(dateStr).replace(/-/g, "") + "-";
+function docPrefix(dateStr) {
+  return "BNI-" + String(dateStr).replace(/-/g, "") + "-";
+}
+// その日すでに使われている連番の最大値（手元で分かる範囲）
+function localMaxSeq(invoices, dateStr) {
+  const prefix = docPrefix(dateStr);
   const nums = (invoices || [])
     .filter((v) => String(v.docNumber || "").indexOf(prefix) === 0)
     .map((v) => parseInt(String(v.docNumber).slice(prefix.length), 10) || 0);
-  const next = (nums.length ? Math.max.apply(null, nums) : 0) + 1;
-  return prefix + String(next).padStart(3, "0");
+  return nums.length ? Math.max.apply(null, nums) : 0;
+}
+function makeDocNumber(invoices, dateStr) {
+  return docPrefix(dateStr) + String(localMaxSeq(invoices, dateStr) + 1).padStart(3, "0");
+}
+
+/* 請求書番号を「予約」して取る
+   ------------------------------------------------------------
+   複数の人が同じ瞬間に登録しても番号が重複しないように、
+   Firestore のトランザクション（順番待ちの仕組み）で
+   1つずつ確実に番号を払い出す。
+   カウンターが無い日は、手元で分かっている最大値から始める。
+   オフライン等で失敗したときは手元採番に切り替え、呼び出し元に知らせる。 */
+async function reserveDocNumber(db, dateStr, fallbackMax) {
+  const ymd = String(dateStr).replace(/-/g, "");
+  const ref = db.collection(COL.counters).doc(ymd);
+  const seq = await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const cur = (snap.exists && typeof snap.data().seq === "number")
+      ? snap.data().seq
+      : (fallbackMax || 0);
+    const next = cur + 1;
+    tx.set(ref, { seq: next }, { merge: true });
+    return next;
+  });
+  return docPrefix(dateStr) + String(seq).padStart(3, "0");
 }
 const sortByTsDesc = (arr) => arr.slice().sort((a, b) => (Number(b._ts) || 0) - (Number(a._ts) || 0));
+
+/* 旧バージョン（マスターを1つの配列でまとめて保存していた形）から
+   「1件＝1ドキュメント」形式へ引っ越す。
+   ・すでに引っ越し済みなら何もしない
+   ・同じ端末・別の端末で同時に走っても、同じIDで書くだけなので壊れない */
+async function migrateMasters(db) {
+  for (let i = 0; i < MASTER_KEYS.length; i++) {
+    const key = MASTER_KEYS[i];
+    const oldRef = db.collection(COL.masters).doc(key);
+    const oldSnap = await oldRef.get();
+    if (!oldSnap.exists) continue;
+
+    const arr = oldSnap.data().value;
+    if (!Array.isArray(arr) || arr.length === 0) { await oldRef.delete(); continue; }
+
+    const batch = db.batch();
+    arr.forEach((item, idx) => {
+      const id = item.id || (key + "-" + idx + "-" + Math.random().toString(36).slice(2, 8));
+      const doc = stripUndefined(Object.assign({}, item, { id: id, order: idx }));
+      batch.set(db.collection(COL[key]).doc(id), doc, { merge: true });
+    });
+    batch.delete(oldRef);
+    await batch.commit();
+  }
+}
 
 /* localStorage（オフライン時の予備・クラウドが本命） */
 const LS = { invoices: "bni_invoices_v1", masters: "bni_masters_v1" };
@@ -457,7 +527,7 @@ function ItemRow({ item, idx, trainings, regions, onChange, onClear }) {
 /* ============================================================
    入力画面（受講者用）
    ============================================================ */
-function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, onView, saved, onReset, fbStatus }) {
+function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, onView, saved, saving, onReset, fbStatus }) {
   const members   = masters.members || [];
   const trainings = masters.trainings || [];
   const regions   = masters.regions || [];
@@ -508,6 +578,12 @@ function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, onView,
             合計 <b>¥{fmt(calcTotal(saved.items))}</b>／{filledOf(saved.items).length}件。
             下のボタンからPDFを保存して保管してください。
           </div>
+          {saved.numberProvisional ? (
+            <div style={{ background: "#fff8e1", border: "1px solid #ffd54f", borderRadius: 8, padding: "10px 12px", fontSize: 13, lineHeight: 1.8, color: "#6b5600", marginBottom: 14 }}>
+              ⚠️ ネットにつながっていない状態で登録したため、<b>請求書番号は仮</b>です。
+              他の人と番号が重なっている可能性があります。ネットにつないでから管理者にご連絡ください。
+            </div>
+          ) : null}
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
             <button style={S.btn("#1b7f43")} onClick={() => onPrint(saved)}>🖨 PDFを表示・保存する</button>
             <button style={S.ghost} onClick={() => onView(saved)}>👀 入力した内容を見る</button>
@@ -582,7 +658,10 @@ function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, onView,
                     placeholder="補足があれば記入してください" />
         </Field>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
-          <button style={S.btn(RED)} onClick={onSave}>💾 この内容で請求書を登録する</button>
+          <button style={Object.assign({}, S.btn(saving ? "#b9909a" : RED), saving ? { cursor: "wait" } : null)}
+                  disabled={saving} onClick={onSave}>
+            {saving ? "登録しています…" : "💾 この内容で請求書を登録する"}
+          </button>
           <button style={S.ghost} onClick={onReset}>🧹 入力をやり直す</button>
           <div style={{ flex: 1 }} />
           <span style={S.tiny}>
@@ -737,7 +816,10 @@ function HistoryPanel({ invoices, masters, onView, onToggle }) {
                   return (
                     <tr key={v.id}>
                       <td><StatusBadge status={v.status} small onClick={() => onToggle(v)} /></td>
-                      <td style={{ fontWeight: 700, whiteSpace: "nowrap" }}>{v.docNumber}</td>
+                      <td style={{ fontWeight: 700, whiteSpace: "nowrap" }}>
+                        {v.docNumber}
+                        {v.numberProvisional ? <span title="オフラインで登録された仮番号です。重複していないか確認してください" style={{ color: "#c07a00", marginLeft: 5 }}>⚠</span> : null}
+                      </td>
                       <td style={{ whiteSpace: "nowrap" }}>{v.memberName}</td>
                       <td style={{ whiteSpace: "nowrap" }}>{fmtSlash(v.createdAt)}</td>
                       <td style={{ whiteSpace: "nowrap", fontSize: 13, color: "#666" }}>
@@ -1110,6 +1192,7 @@ function App() {
 
   const [form, setForm]         = useState(EMPTY_FORM);
   const [saved, setSaved]       = useState(null);
+  const [saving, setSaving]     = useState(false);
   const [viewInv, setViewInv]   = useState(null);
   const [printHTML, setPrintHTML] = useState(null);
   const [confirmData, setConfirmData] = useState(null);
@@ -1118,48 +1201,103 @@ function App() {
 
   /* --- Firebase 接続・購読 --- */
   useEffect(() => {
-    let unsubA = null, unsubB = null;
-    loadFirebase().then((d) => {
+    const unsubs = [];
+    let alive = true;
+
+    loadFirebase().then(async (d) => {
+      if (!alive) return;
       setDb(d);
       setFbStatus("online");
 
-      unsubA = d.collection(COL.invoices).onSnapshot(
+      // 旧バージョン（配列マスター）からの引っ越し。何度実行しても安全。
+      try { await migrateMasters(d); } catch (e) { /* 引っ越しに失敗しても以降の処理は続ける */ }
+      if (!alive) return;
+
+      // 請求書
+      unsubs.push(d.collection(COL.invoices).onSnapshot(
         (snap) => {
           const arr = snap.docs.map((x) => Object.assign({}, x.data(), { _fbId: x.id }));
           setInvoices(sortByTsDesc(arr));
           saveLS(LS.invoices, arr);
         },
         () => setFbStatus("offline")
-      );
+      ));
 
-      unsubB = d.collection(COL.masters).onSnapshot(
-        (snap) => {
-          const base = EMPTY_MASTERS();
-          snap.forEach((x) => { base[x.id] = x.data().value; });
-          if (!base.settings) base.settings = EMPTY_MASTERS().settings;
-          setMasters(base);
-          saveLS(LS.masters, base);
+      // マスター各種（1件＝1ドキュメント）
+      MASTER_KEYS.forEach((key) => {
+        unsubs.push(d.collection(COL[key]).onSnapshot(
+          (snap) => {
+            const arr = snap.docs
+              .map((x) => Object.assign({ id: x.id }, x.data()))
+              .sort((a, b) => (typeof a.order === "number" ? a.order : 9999) - (typeof b.order === "number" ? b.order : 9999));
+            setMasters((m) => {
+              const next = Object.assign({}, m, { [key]: arr });
+              saveLS(LS.masters, next);
+              return next;
+            });
+          },
+          () => setFbStatus("offline")
+        ));
+      });
+
+      // 設定
+      unsubs.push(d.collection(COL.masters).doc("settings").onSnapshot(
+        (doc) => {
+          const v = doc.exists ? doc.data().value : null;
+          setMasters((m) => {
+            const next = Object.assign({}, m, { settings: v || EMPTY_MASTERS().settings });
+            saveLS(LS.masters, next);
+            return next;
+          });
         },
         () => setFbStatus("offline")
-      );
+      ));
     }).catch(() => setFbStatus("offline"));
 
-    return () => { if (unsubA) unsubA(); if (unsubB) unsubB(); };
+    return () => { alive = false; unsubs.forEach((u) => { try { u(); } catch (e) {} }); };
   }, []);
 
-  /* --- マスター保存 --- */
+  /* --- マスター保存 ---
+     一覧まるごとではなく「変わった項目だけ」を書き込む。
+     手元に無い項目（他の人がちょうど追加したもの）は消さないので、
+     複数人が同時に編集してもお互いの登録が消えない。 */
   const setMasterKey = (key, value) => {
+    const prev = masters[key] || [];
     const next = Object.assign({}, masters, { [key]: value });
     setMasters(next);
     saveLS(LS.masters, next);
-    if (db) {
-      db.collection(COL.masters).doc(key).set({ value: stripUndefined(value) })
+    if (!db) return;
+
+    if (key === "settings") {
+      db.collection(COL.masters).doc("settings").set({ value: stripUndefined(value) })
         .catch(() => setFbStatus("offline"));
+      return;
     }
+
+    const coll = db.collection(COL[key]);
+    const prevById = {};
+    prev.forEach((x) => { prevById[x.id] = x; });
+    const nextIds = {};
+
+    (value || []).forEach((item, i) => {
+      nextIds[item.id] = true;
+      const withOrder = Object.assign({}, item, { order: i });
+      const before = prevById[item.id];
+      const unchanged = before && JSON.stringify(Object.assign({}, before, { order: i })) === JSON.stringify(withOrder);
+      if (!unchanged) {
+        coll.doc(item.id).set(stripUndefined(withOrder)).catch(() => setFbStatus("offline"));
+      }
+    });
+
+    // 手元にあって新しい一覧から消えたものだけ削除する
+    prev.forEach((item) => {
+      if (!nextIds[item.id]) coll.doc(item.id).delete().catch(() => setFbStatus("offline"));
+    });
   };
 
   /* --- 請求書の保存 --- */
-  const saveInvoice = () => {
+  const saveInvoice = async () => {
+    if (saving) return;                       // 二重クリック防止
     const member = (masters.members || []).find((m) => m.id === form.memberId);
     if (!member) { alert("「入力者（請求元）」を選んでください。"); return; }
 
@@ -1172,7 +1310,24 @@ function App() {
       return;
     }
 
-    const docNumber = makeDocNumber(invoices, form.createdAt);
+    setSaving(true);
+
+    // 番号を「予約」して取る（同時に登録されても重複しない）
+    let docNumber = "";
+    let numberProvisional = false;
+    if (db) {
+      try {
+        docNumber = await reserveDocNumber(db, form.createdAt, localMaxSeq(invoices, form.createdAt));
+      } catch (e) {
+        docNumber = makeDocNumber(invoices, form.createdAt);
+        numberProvisional = true;
+        setFbStatus("offline");
+      }
+    } else {
+      docNumber = makeDocNumber(invoices, form.createdAt);
+      numberProvisional = true;
+    }
+
     const inv = {
       id: uid(),
       docNumber: docNumber,
@@ -1188,6 +1343,7 @@ function App() {
       note: form.note || "",
       status: "unpaid",
       paidAt: null,
+      numberProvisional: numberProvisional,
       _ts: Date.now(),
     };
 
@@ -1195,10 +1351,11 @@ function App() {
     setInvoices(next);
     saveLS(LS.invoices, next);
     if (db) {
-      db.collection(COL.invoices).doc(inv.id).set(stripUndefined(inv))
-        .catch(() => setFbStatus("offline"));
+      try { await db.collection(COL.invoices).doc(inv.id).set(stripUndefined(inv)); }
+      catch (e) { setFbStatus("offline"); }
     }
     setSaved(inv);
+    setSaving(false);
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
@@ -1303,7 +1460,7 @@ function App() {
         {tab === "entry" ? (
           <EntryPanel form={form} setForm={setForm} masters={masters} invoices={invoices}
                       onSave={saveInvoice} onPrint={printInvoice} onView={setViewInv} saved={saved}
-                      onReset={resetForm} fbStatus={fbStatus} />
+                      saving={saving} onReset={resetForm} fbStatus={fbStatus} />
         ) : null}
         {tab === "history" && isAdmin ? (
           <HistoryPanel invoices={invoices} masters={masters} onView={setViewInv} onToggle={toggleStatus} />
