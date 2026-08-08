@@ -88,7 +88,7 @@ const { useState, useEffect, useMemo } = React;
    ・管理者：パスワードで入り、履歴の閲覧と「未払い／支払い済」管理
    ============================================================ */
 
-const APP_VERSION = "Ver1-001";
+const APP_VERSION = "Ver1-002";
 
 /* ------------------------------------------------------------
    ★ 管理者パスワードの初期値（マスター管理画面から変更できます）
@@ -457,7 +457,7 @@ function ItemRow({ item, idx, trainings, regions, onChange, onClear }) {
 /* ============================================================
    入力画面（受講者用）
    ============================================================ */
-function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, saved, onReset, fbStatus }) {
+function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, onView, saved, onReset, fbStatus }) {
   const members   = masters.members || [];
   const trainings = masters.trainings || [];
   const regions   = masters.regions || [];
@@ -510,6 +510,7 @@ function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, saved, 
           </div>
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
             <button style={S.btn("#1b7f43")} onClick={() => onPrint(saved)}>🖨 PDFを表示・保存する</button>
+            <button style={S.ghost} onClick={() => onView(saved)}>👀 入力した内容を見る</button>
             <button style={S.ghost} onClick={onReset}>🧹 新しく入力する</button>
           </div>
         </div>
@@ -593,26 +594,44 @@ function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, saved, 
       {/* 自分の過去の請求書 */}
       {form.memberId ? (
         <div style={S.card}>
-          <div style={S.h2}>📄 あなたが登録した請求書</div>
+          <div style={S.h2}>
+            📄 あなたが登録した請求書
+            <span style={{ ...S.tiny, fontWeight: 400 }}>（「👀 内容を見る」で入力したトレーニングを確認できます）</span>
+          </div>
           {myInvoices.length === 0 ? (
             <div style={S.tiny}>まだ登録がありません。</div>
           ) : (
             <div className="tbl-wrap">
               <table className="hist">
                 <thead><tr>
-                  <th style={{ width: 110 }}>状態</th><th>請求書番号</th><th>請求日</th>
-                  <th style={{ textAlign: "right" }}>合計金額</th><th style={{ width: 110 }}></th>
+                  <th style={{ width: 110 }}>状態</th>
+                  <th>請求書番号</th>
+                  <th>請求日</th>
+                  <th>対象期間</th>
+                  <th style={{ textAlign: "center" }}>件数</th>
+                  <th style={{ textAlign: "right" }}>合計金額</th>
+                  <th style={{ width: 190 }}></th>
                 </tr></thead>
                 <tbody>
-                  {myInvoices.map((v) => (
-                    <tr key={v.id}>
-                      <td><StatusBadge status={v.status} small /></td>
-                      <td style={{ fontWeight: 700 }}>{v.docNumber}</td>
-                      <td>{fmtSlash(v.createdAt)}</td>
-                      <td style={{ textAlign: "right", fontWeight: 700 }}>¥{fmt(calcTotal(v.items))}</td>
-                      <td><button style={{ ...S.ghost, padding: "6px 12px", fontSize: 13 }} onClick={() => onPrint(v)}>🖨 PDF</button></td>
-                    </tr>
-                  ))}
+                  {myInvoices.map((v) => {
+                    const pp = periodOf(v.items);
+                    return (
+                      <tr key={v.id}>
+                        <td><StatusBadge status={v.status} small /></td>
+                        <td style={{ fontWeight: 700, whiteSpace: "nowrap" }}>{v.docNumber}</td>
+                        <td style={{ whiteSpace: "nowrap" }}>{fmtSlash(v.createdAt)}</td>
+                        <td style={{ whiteSpace: "nowrap", fontSize: 13, color: "#666" }}>
+                          {pp.from ? fmtSlash(pp.from) + " 〜 " + fmtSlash(pp.to) : "—"}
+                        </td>
+                        <td style={{ textAlign: "center" }}>{filledOf(v.items).length}</td>
+                        <td style={{ textAlign: "right", fontWeight: 700 }}>¥{fmt(calcTotal(v.items))}</td>
+                        <td style={{ whiteSpace: "nowrap" }}>
+                          <button style={{ ...S.ghost, padding: "6px 12px", fontSize: 13, marginRight: 6 }} onClick={() => onView(v)}>👀 内容を見る</button>
+                          <button style={{ ...S.ghost, padding: "6px 12px", fontSize: 13 }} onClick={() => onPrint(v)}>🖨 PDF</button>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -744,7 +763,7 @@ function HistoryPanel({ invoices, masters, onView, onToggle }) {
 /* ============================================================
    管理者：詳細モーダル
    ============================================================ */
-function DetailModal({ inv, onClose, onPrint, onToggle, onDelete }) {
+function DetailModal({ inv, onClose, onPrint, onToggle, onDelete, readOnly }) {
   if (!inv) return null;
   const items = filledOf(inv.items);
   const p = periodOf(inv.items);
@@ -807,14 +826,26 @@ function DetailModal({ inv, onClose, onPrint, onToggle, onDelete }) {
           </div>
         ) : null}
 
-        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-          <button style={S.btn(inv.status === "paid" ? "#6b7280" : "#1b7f43")} onClick={() => onToggle(inv)}>
-            {inv.status === "paid" ? "🔴 未払いに戻す" : "🟢 支払い済に登録する"}
-          </button>
-          <button style={S.btn(NAVY)} onClick={() => onPrint(inv)}>🖨 PDFを表示</button>
-          <div style={{ flex: 1 }} />
-          <button style={{ ...S.ghost, color: RED, borderColor: "#f0b8c0" }} onClick={() => onDelete(inv)}>🗑 削除</button>
-        </div>
+        {readOnly ? (
+          <div>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <button style={S.btn(NAVY)} onClick={() => onPrint(inv)}>🖨 PDFを表示・保存する</button>
+              <button style={S.ghost} onClick={onClose}>閉じる</button>
+            </div>
+            <div style={{ ...S.tiny, marginTop: 12, lineHeight: 1.8 }}>
+              ※ 登録した内容はここから修正できません。間違いがあった場合は管理者に連絡してください。
+            </div>
+          </div>
+        ) : (
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <button style={S.btn(inv.status === "paid" ? "#6b7280" : "#1b7f43")} onClick={() => onToggle(inv)}>
+              {inv.status === "paid" ? "🔴 未払いに戻す" : "🟢 支払い済に登録する"}
+            </button>
+            <button style={S.btn(NAVY)} onClick={() => onPrint(inv)}>🖨 PDFを表示</button>
+            <div style={{ flex: 1 }} />
+            <button style={{ ...S.ghost, color: RED, borderColor: "#f0b8c0" }} onClick={() => onDelete(inv)}>🗑 削除</button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1271,7 +1302,7 @@ function App() {
         <div style={{ height: 18 }} />
         {tab === "entry" ? (
           <EntryPanel form={form} setForm={setForm} masters={masters} invoices={invoices}
-                      onSave={saveInvoice} onPrint={printInvoice} saved={saved}
+                      onSave={saveInvoice} onPrint={printInvoice} onView={setViewInv} saved={saved}
                       onReset={resetForm} fbStatus={fbStatus} />
         ) : null}
         {tab === "history" && isAdmin ? (
@@ -1290,7 +1321,8 @@ function App() {
       ) : null}
 
       <DetailModal inv={viewInv} onClose={() => setViewInv(null)} onPrint={printInvoice}
-                   onToggle={toggleStatus} onDelete={deleteInvoice} />
+                   onToggle={toggleStatus} onDelete={deleteInvoice}
+                   readOnly={!isAdmin || tab === "entry"} />
 
       <ConfirmDialog data={confirmData} onClose={() => setConfirmData(null)} />
 
