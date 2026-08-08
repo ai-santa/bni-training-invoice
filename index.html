@@ -1,0 +1,1327 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BNI トレーニング受講料 請求システム</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&display=swap" rel="stylesheet">
+
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script>
+    // ⚠️ 真っ白対策（IERで実証済み）：
+    //    Babel 8 以降は JSX を「import 方式(automatic runtime)」で変換してしまい、
+    //    ブラウザで直接実行できない import 文が生成されて画面が真っ白になる。
+    //    そこで従来方式(classic runtime = React.createElement)のプリセットを登録し、
+    //    下の <script type="text/babel" data-presets="classic-react"> で必ずこれを使わせる。
+    Babel.registerPreset('classic-react', {
+      presets: [[Babel.availablePresets['react'], { runtime: 'classic' }]]
+    });
+  </script>
+
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Noto Sans JP', 'Hiragino Sans', 'Meiryo', sans-serif;
+      background: #f5f6f8;
+      color: #222;
+      -webkit-text-size-adjust: 100%;
+    }
+    input, select, textarea, button { font-family: inherit; font-size: 15px; }
+    input, select, textarea {
+      width: 100%; padding: 9px 10px; border: 1px solid #ccd0d6; border-radius: 7px;
+      background: #fff; color: #222; outline: none;
+    }
+    input:focus, select:focus, textarea:focus { border-color: #c8102e; box-shadow: 0 0 0 3px #c8102e22; }
+    button { cursor: pointer; border: none; }
+
+    /* ---- 明細行のレイアウト（PCは表・スマホはカード） ---- */
+    .item-head, .item-row {
+      display: grid;
+      grid-template-columns: 38px 150px minmax(0,1fr) 170px 130px 42px;
+      gap: 8px; align-items: center;
+    }
+    .item-head { padding: 8px 10px; font-size: 12px; font-weight: 700; color: #fff; background: #1f3864; border-radius: 8px 8px 0 0; }
+    .item-row { padding: 7px 10px; border-bottom: 1px solid #eceef1; background: #fff; }
+    .item-row:nth-child(even) { background: #fafbfc; }
+    .m-label { display: none; font-size: 11px; color: #8a8f98; margin-bottom: 3px; font-weight: 700; }
+
+    @media (max-width: 820px) {
+      .item-head { display: none; }
+      .item-row {
+        grid-template-columns: 1fr 1fr; row-gap: 8px; column-gap: 10px;
+        background: #fff !important; border: 1px solid #e3e6ea; border-radius: 10px;
+        padding: 12px; margin-bottom: 10px;
+      }
+      .cell-no   { grid-column: 1 / 2; font-weight: 700; color: #c8102e; font-size: 13px; }
+      .cell-del  { grid-column: 2 / 3; justify-self: end; }
+      .cell-date { grid-column: 1 / -1; }
+      .cell-ttl  { grid-column: 1 / -1; }
+      .cell-reg  { grid-column: 1 / 2; }
+      .cell-fee  { grid-column: 2 / 3; }
+      .m-label   { display: block; }
+    }
+
+    .tbl-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    table.hist { width: 100%; border-collapse: collapse; font-size: 14px; min-width: 760px; }
+    table.hist th { background: #1f3864; color: #fff; font-weight: 700; font-size: 12px; padding: 10px 8px; text-align: left; white-space: nowrap; }
+    table.hist td { padding: 10px 8px; border-bottom: 1px solid #eceef1; vertical-align: middle; }
+    table.hist tr:hover td { background: #fdecef; }
+
+    .fade-in { animation: fi .18s ease-out; }
+    @keyframes fi { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+<script type="text/babel" data-presets="classic-react">
+const { useState, useEffect, useMemo } = React;
+
+/* ============================================================
+   BNI トレーニング受講料 請求システム
+   ・受講者：過去6か月分のトレーニングをまとめて入力 → 請求書PDF
+   ・管理者：パスワードで入り、履歴の閲覧と「未払い／支払い済」管理
+   ============================================================ */
+
+const APP_VERSION = "Ver1-001";
+
+/* ------------------------------------------------------------
+   ★ 管理者パスワードの初期値（マスター管理画面から変更できます）
+      ここを書き換えると「最初の1回」のパスワードが変わります。
+   ------------------------------------------------------------ */
+const DEFAULT_ADMIN_PASSWORD = "bni-dna";
+
+/* ------------------------------------------------------------
+   Firebase（IERアプリと同じプロジェクトを、BNI専用の入れ物で間借り）
+   ※ 入れ物（コレクション）名が違うので IER のデータとは混ざりません
+   ------------------------------------------------------------ */
+const FIREBASE_CONFIG = {
+  apiKey:            "AIzaSyAJmNm7RjaBhe8AAUfGqjL7RS37MLmEBII",
+  authDomain:        "invoice-app-544b6.firebaseapp.com",
+  projectId:         "invoice-app-544b6",
+  storageBucket:     "invoice-app-544b6.firebasestorage.app",
+  messagingSenderId: "245544696406",
+  appId:             "1:245544696406:web:a08ba67808c73762eb19f7",
+};
+
+const COL = { invoices: "bni_invoices", masters: "bni_masters" };
+
+const loadFirebase = (() => {
+  let promise = null;
+  return () => {
+    if (promise) return promise;
+    promise = new Promise((resolve, reject) => {
+      const load = (s) => new Promise((res, rej) => {
+        const el = document.createElement("script");
+        el.src = s; el.onload = res; el.onerror = rej;
+        document.head.appendChild(el);
+      });
+      Promise.all([
+        load("https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"),
+        load("https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"),
+      ]).then(() => {
+        const app = window.firebase.initializeApp(FIREBASE_CONFIG);
+        resolve(window.firebase.firestore());
+      }).catch(reject);
+    });
+    return promise;
+  };
+})();
+
+// Firestore は undefined を保存できないため、保存前に取り除く
+function stripUndefined(value) {
+  if (Array.isArray(value)) return value.map(stripUndefined);
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const k in value) {
+      if (value[k] === undefined) continue;
+      out[k] = stripUndefined(value[k]);
+    }
+    return out;
+  }
+  return value;
+}
+
+/* ============================================================
+   共通ヘルパー
+   ============================================================ */
+const pad2 = (n) => String(n).padStart(2, "0");
+const fmt  = (n) => Number(n || 0).toLocaleString("ja-JP");
+const uid  = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+
+function todayStr() {
+  const d = new Date();
+  return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
+}
+function fmtJP(s) {
+  if (!s) return "—";
+  const p = String(s).split("-");
+  return p.length === 3 ? Number(p[0]) + "年" + Number(p[1]) + "月" + Number(p[2]) + "日" : s;
+}
+function fmtSlash(s) {
+  if (!s) return "";
+  const p = String(s).split("-");
+  return p.length === 3 ? p[0] + "/" + p[1] + "/" + p[2] : s;
+}
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+function escBr(s) {
+  return esc(s).replace(/\n/g, "<br>");
+}
+
+const EMPTY_ITEM  = () => ({ id: uid(), date: "", title: "", region: "", fee: "" });
+const BLANK_ITEMS = (n) => Array.from({ length: n || 10 }, EMPTY_ITEM);
+
+const EMPTY_MASTERS = () => ({
+  members: [],
+  trainings: [],
+  regions: [],
+  settings: { billTo: "BNI 福井 御中", adminPassword: "", footerNote: "" },
+});
+
+const EMPTY_FORM = () => ({
+  id: null, docNumber: "", createdAt: todayStr(), memberId: "",
+  items: BLANK_ITEMS(10), note: "", status: "unpaid", paidAt: null,
+});
+
+const isFilled  = (it) => !!(it.date || it.title || it.region || (it.fee !== "" && it.fee != null));
+const filledOf  = (items) => (items || []).filter(isFilled);
+const calcTotal = (items) => (items || []).reduce((s, it) => s + (Number(it.fee) || 0), 0);
+function periodOf(items) {
+  const ds = (items || []).map((i) => i.date).filter(Boolean).sort();
+  return ds.length ? { from: ds[0], to: ds[ds.length - 1] } : { from: "", to: "" };
+}
+function makeDocNumber(invoices, dateStr) {
+  const prefix = "BNI-" + String(dateStr).replace(/-/g, "") + "-";
+  const nums = (invoices || [])
+    .filter((v) => String(v.docNumber || "").indexOf(prefix) === 0)
+    .map((v) => parseInt(String(v.docNumber).slice(prefix.length), 10) || 0);
+  const next = (nums.length ? Math.max.apply(null, nums) : 0) + 1;
+  return prefix + String(next).padStart(3, "0");
+}
+const sortByTsDesc = (arr) => arr.slice().sort((a, b) => (Number(b._ts) || 0) - (Number(a._ts) || 0));
+
+/* localStorage（オフライン時の予備・クラウドが本命） */
+const LS = { invoices: "bni_invoices_v1", masters: "bni_masters_v1" };
+function loadLS(key, fallback) {
+  try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; }
+  catch (e) { return fallback; }
+}
+function saveLS(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) {}
+}
+
+/* ============================================================
+   スタイル
+   ============================================================ */
+const RED  = "#c8102e";
+const NAVY = "#1f3864";
+const S = {
+  page:    { maxWidth: 1140, margin: "0 auto", padding: "0 14px 60px" },
+  card:    { background: "#fff", borderRadius: 12, boxShadow: "0 1px 3px #0000000f", padding: 18, marginBottom: 16 },
+  h2:      { fontSize: 16, fontWeight: 700, color: NAVY, marginBottom: 12, display: "flex", alignItems: "center", gap: 8 },
+  label:   { display: "block", fontSize: 12, fontWeight: 700, color: "#6b7280", marginBottom: 5 },
+  btn: (bg, fg) => ({
+    background: bg, color: fg || "#fff", borderRadius: 8, padding: "10px 18px",
+    fontWeight: 700, fontSize: 14, whiteSpace: "nowrap",
+  }),
+  ghost:   { background: "#fff", color: NAVY, border: "1px solid #ccd0d6", borderRadius: 8, padding: "9px 16px", fontWeight: 700, fontSize: 14 },
+  tiny:    { fontSize: 12, color: "#8a8f98" },
+  modalBg: { position: "fixed", inset: 0, background: "#0009", zIndex: 3000, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 },
+  modal:   { background: "#fff", borderRadius: 14, padding: 22, maxWidth: 480, width: "100%", boxShadow: "0 10px 40px #0004" },
+};
+
+/* ============================================================
+   請求書PDF（A4縦）
+   ============================================================ */
+function buildInvoiceHTML(inv, settings) {
+  const items = filledOf(inv.items);
+  const total = calcTotal(items);
+  const p     = periodOf(items);
+  const rows  = items.slice();
+  while (rows.length < 12) rows.push({ date: "", title: "", region: "", fee: "" });
+
+  const bodyRows = rows.map((it, i) => {
+    const empty = !isFilled(it);
+    const bg = i % 2 === 0 ? "#ffffff" : "#fbfbfc";
+    return '<tr style="background:' + bg + ';">'
+      + '<td style="padding:6px 6px;border-bottom:1px solid #d8dbe0;text-align:center;color:#666;font-size:9.5pt;">' + (empty ? "" : (i + 1)) + '</td>'
+      + '<td style="padding:6px 8px;border-bottom:1px solid #d8dbe0;white-space:nowrap;">' + (empty ? "" : esc(fmtSlash(it.date))) + '</td>'
+      + '<td style="padding:6px 8px;border-bottom:1px solid #d8dbe0;word-break:break-all;line-height:1.35;">' + esc(it.title) + '</td>'
+      + '<td style="padding:6px 8px;border-bottom:1px solid #d8dbe0;word-break:break-all;">' + esc(it.region) + '</td>'
+      + '<td style="padding:6px 8px;border-bottom:1px solid #d8dbe0;text-align:right;white-space:nowrap;font-weight:' + (empty ? 400 : 700) + ';">'
+        + (empty ? "" : "¥ " + fmt(it.fee)) + '</td>'
+      + '</tr>';
+  }).join("");
+
+  const periodText = (p.from && p.to)
+    ? (fmtJP(p.from) + " 〜 " + fmtJP(p.to))
+    : "—";
+
+  const billTo = (settings && settings.billTo) ? settings.billTo : "BNI 福井 御中";
+
+  return '<!DOCTYPE html>\n'
++ '<html lang="ja"><head><meta charset="UTF-8">\n'
++ '<title>請求書 ' + esc(inv.docNumber) + '</title>\n'
++ '<style>\n'
++ "@import url('https://fonts.googleapis.com/css2?family=Noto+Serif+JP:wght@400;700&display=swap');\n"
++ '*{box-sizing:border-box;margin:0;padding:0;}\n'
++ 'html,body{width:210mm;min-height:297mm;}\n'
++ "body{font-family:'Noto Serif JP',Georgia,serif;color:#1a1a1a;background:#fff;padding:14mm 15mm 12mm;font-size:10.5pt;}\n"
++ '@page{size:A4 portrait;margin:0;}\n'
++ '@media print{html,body{width:210mm;min-height:297mm;}}\n'
++ '</style></head><body>\n'
+
+/* ヘッダー */
++ '<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;">'
++   '<div>'
++     '<div style="display:flex;align-items:baseline;gap:12px;">'
++       '<h1 style="font-size:1.9rem;font-weight:700;letter-spacing:0.18em;color:' + NAVY + ';margin:0;">請 求 書</h1>'
++       '<span style="background:' + RED + ';color:#fff;font-size:0.58rem;font-weight:700;letter-spacing:0.14em;padding:3px 10px;border-radius:2px;">INVOICE</span>'
++     '</div>'
++     '<table style="font-size:0.78rem;border-collapse:collapse;margin-top:8px;">'
++       '<tr><td style="color:#666;padding-right:10px;padding-bottom:3px;">請求書番号</td>'
++           '<td style="font-weight:700;padding-bottom:3px;">' + esc(inv.docNumber) + '</td></tr>'
++       '<tr><td style="color:#666;padding-right:10px;">請求日</td>'
++           '<td style="font-weight:700;">' + fmtJP(inv.createdAt) + '</td></tr>'
++     '</table>'
++   '</div>'
++   '<div style="text-align:right;font-size:0.74rem;line-height:1.85;color:#222;">'
++     '<div style="font-size:0.62rem;color:#888;letter-spacing:0.1em;">請 求 元</div>'
++     '<div style="font-weight:700;font-size:1rem;color:#111;margin-bottom:2px;">' + esc(inv.memberName) + '</div>'
++     (inv.memberAddress ? '<div>' + escBr(inv.memberAddress) + '</div>' : '')
++     (inv.memberTel ? '<div>TEL: ' + esc(inv.memberTel) + '</div>' : '')
++     (inv.memberInvoiceNo ? '<div style="font-size:0.7rem;color:#555;">登録番号: ' + esc(inv.memberInvoiceNo) + '</div>' : '')
++   '</div>'
++ '</div>'
++ '<div style="height:2.5px;background:linear-gradient(to right,' + RED + ',' + NAVY + ',#dfe3ea);margin-bottom:12px;"></div>'
+
+/* 宛先＋対象期間 */
++ '<div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:12px;">'
++   '<div>'
++     '<div style="font-size:1.15rem;font-weight:700;border-bottom:2px solid ' + NAVY + ';padding-bottom:3px;display:inline-block;">'
++       esc(billTo) + '</div>'
++     '<div style="font-size:0.8rem;color:#444;margin-top:8px;">下記のとおりご請求申し上げます。</div>'
++   '</div>'
++   '<div style="font-size:0.78rem;color:#444;text-align:right;">'
++     '<div style="color:#888;font-size:0.68rem;">対象期間</div>'
++     '<div style="font-weight:700;">' + periodText + '</div>'
++   '</div>'
++ '</div>'
+
+/* 合計 */
++ '<div style="display:flex;align-items:center;gap:14px;background:#fdecef;border:1.5px solid ' + RED + ';border-radius:4px;padding:10px 16px;margin-bottom:14px;">'
++   '<div style="font-size:0.86rem;font-weight:700;color:' + NAVY + ';letter-spacing:0.06em;">ご請求金額（合計）</div>'
++   '<div style="flex:1;text-align:right;font-size:1.5rem;font-weight:700;color:#111;">¥ ' + fmt(total) + '</div>'
++   '<div style="font-size:0.7rem;color:#666;">（受講 ' + items.length + ' 件）</div>'
++ '</div>'
+
+/* 明細 */
++ '<div style="font-size:0.82rem;font-weight:700;color:' + NAVY + ';margin-bottom:5px;">■ 受講トレーニング明細</div>'
++ '<table style="width:100%;border-collapse:collapse;font-size:9.5pt;table-layout:fixed;">'
++   '<colgroup><col style="width:26px"><col style="width:76px"><col><col style="width:120px"><col style="width:86px"></colgroup>'
++   '<thead><tr style="background:' + NAVY + ';color:#fff;">'
++     '<th style="padding:7px 4px;text-align:center;font-size:9pt;">No</th>'
++     '<th style="padding:7px 8px;text-align:left;font-size:9pt;">受講日</th>'
++     '<th style="padding:7px 8px;text-align:left;font-size:9pt;">トレーニング名</th>'
++     '<th style="padding:7px 8px;text-align:left;font-size:9pt;">リージョン</th>'
++     '<th style="padding:7px 8px;text-align:right;font-size:9pt;">受講料金</th>'
++   '</tr></thead><tbody>' + bodyRows + '</tbody>'
++   '<tfoot><tr style="background:#f2f4f7;">'
++     '<td colspan="4" style="padding:9px 10px;text-align:right;font-weight:700;border-top:2px solid ' + NAVY + ';">合　計</td>'
++     '<td style="padding:9px 8px;text-align:right;font-weight:700;font-size:1.05rem;border-top:2px solid ' + NAVY + ';">¥ ' + fmt(total) + '</td>'
++   '</tr></tfoot>'
++ '</table>'
+
+/* 振込先・備考 */
++ '<div style="display:flex;gap:14px;margin-top:16px;">'
++   '<div style="flex:1;border:1px solid #c9ced6;border-radius:4px;padding:10px 12px;">'
++     '<div style="font-size:0.72rem;font-weight:700;color:' + NAVY + ';margin-bottom:4px;">お振込先</div>'
++     '<div style="font-size:0.8rem;line-height:1.7;white-space:pre-wrap;">' + (inv.memberBank ? escBr(inv.memberBank) : '<span style="color:#aaa;">（未登録）</span>') + '</div>'
++   '</div>'
++   '<div style="flex:1;border:1px solid #c9ced6;border-radius:4px;padding:10px 12px;">'
++     '<div style="font-size:0.72rem;font-weight:700;color:' + NAVY + ';margin-bottom:4px;">備考</div>'
++     '<div style="font-size:0.8rem;line-height:1.7;white-space:pre-wrap;">' + (inv.note ? escBr(inv.note) : '<span style="color:#aaa;">—</span>') + '</div>'
++   '</div>'
++ '</div>'
++ ((settings && settings.footerNote) ? '<div style="margin-top:12px;font-size:0.72rem;color:#666;line-height:1.7;white-space:pre-wrap;">' + escBr(settings.footerNote) + '</div>' : '')
++ '<div style="margin-top:18px;text-align:right;font-size:0.62rem;color:#aaa;">BNI トレーニング受講料 請求システム ' + APP_VERSION + '</div>'
++ '</body></html>';
+}
+
+/* ============================================================
+   小さな部品
+   ============================================================ */
+function StatusBadge({ status, onClick, small }) {
+  const paid = status === "paid";
+  const base = {
+    display: "inline-flex", alignItems: "center", gap: 5,
+    background: paid ? "#e6f6ec" : "#fdecef",
+    color: paid ? "#1b7f43" : RED,
+    border: "1.5px solid " + (paid ? "#1b7f43" : RED),
+    borderRadius: 999, padding: small ? "3px 10px" : "5px 14px",
+    fontWeight: 700, fontSize: small ? 12 : 13, whiteSpace: "nowrap",
+    cursor: onClick ? "pointer" : "default",
+  };
+  return (
+    <span style={base} onClick={onClick} title={onClick ? "クリックで支払い状態を切り替え" : ""}>
+      <span style={{ fontSize: small ? 11 : 13 }}>{paid ? "🟢" : "🔴"}</span>
+      {paid ? "支払い済" : "未払い"}
+    </span>
+  );
+}
+
+function Field({ label, children, hint }) {
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <label style={S.label}>{label}</label>
+      {children}
+      {hint ? <div style={{ ...S.tiny, marginTop: 4 }}>{hint}</div> : null}
+    </div>
+  );
+}
+
+function ConfirmDialog({ data, onClose }) {
+  if (!data) return null;
+  return (
+    <div style={S.modalBg} onClick={onClose}>
+      <div style={S.modal} className="fade-in" onClick={(e) => e.stopPropagation()}>
+        <div style={{ fontSize: 17, fontWeight: 700, color: NAVY, marginBottom: 10 }}>{data.title || "確認"}</div>
+        <div style={{ fontSize: 15, lineHeight: 1.8, color: "#333", whiteSpace: "pre-wrap", marginBottom: 20 }}>{data.message}</div>
+        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+          <button style={S.ghost} onClick={onClose}>いいえ</button>
+          <button style={S.btn(data.color || NAVY)} onClick={() => { data.onYes(); onClose(); }}>
+            {data.yesLabel || "はい"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   明細1行
+   ============================================================ */
+function ItemRow({ item, idx, trainings, regions, onChange, onClear }) {
+  const set = (k) => (e) => onChange(idx, k, e.target.value);
+  return (
+    <div className="item-row">
+      <div className="cell-no" style={{ textAlign: "center", color: "#9aa0a8", fontSize: 13, fontWeight: 700 }}>
+        {idx + 1}
+      </div>
+      <div className="cell-date">
+        <span className="m-label">受講日</span>
+        <input type="date" value={item.date} onChange={set("date")} />
+      </div>
+      <div className="cell-ttl" style={{ minWidth: 0 }}>
+        <span className="m-label">トレーニング名</span>
+        <select value={item.title} onChange={set("title")}>
+          <option value="">— 選んでください —</option>
+          {trainings.map((t) => <option key={t.id} value={t.name}>{t.name}</option>)}
+          {item.title && trainings.every((t) => t.name !== item.title)
+            ? <option value={item.title}>{item.title}（マスターにない項目）</option> : null}
+        </select>
+      </div>
+      <div className="cell-reg">
+        <span className="m-label">リージョン</span>
+        <select value={item.region} onChange={set("region")}>
+          <option value="">— 選んでください —</option>
+          {regions.map((r) => <option key={r.id} value={r.name}>{r.name}</option>)}
+          {item.region && regions.every((r) => r.name !== item.region)
+            ? <option value={item.region}>{item.region}（マスターにない項目）</option> : null}
+        </select>
+      </div>
+      <div className="cell-fee">
+        <span className="m-label">受講料金（円）</span>
+        <input type="number" inputMode="numeric" min="0" step="1" placeholder="0"
+               value={item.fee} onChange={set("fee")} style={{ textAlign: "right" }} />
+      </div>
+      <div className="cell-del">
+        <button onClick={() => onClear(idx)} title="この行を消す"
+          style={{ background: "#f3f4f6", color: "#8a8f98", borderRadius: 7, width: 36, height: 36, fontSize: 15 }}>
+          ✕
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   入力画面（受講者用）
+   ============================================================ */
+function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, saved, onReset, fbStatus }) {
+  const members   = masters.members || [];
+  const trainings = masters.trainings || [];
+  const regions   = masters.regions || [];
+  const member    = members.find((m) => m.id === form.memberId);
+
+  const setField = (k, v) => setForm((f) => Object.assign({}, f, { [k]: v }));
+  const setItem = (idx, key, val) => setForm((f) => {
+    const items = f.items.slice();
+    items[idx] = Object.assign({}, items[idx], { [key]: val });
+    return Object.assign({}, f, { items: items });
+  });
+  const clearItem = (idx) => setForm((f) => {
+    const items = f.items.slice();
+    items[idx] = EMPTY_ITEM();
+    return Object.assign({}, f, { items: items });
+  });
+  const addRow = () => setForm((f) => Object.assign({}, f, { items: f.items.concat([EMPTY_ITEM()]) }));
+
+  const filled = filledOf(form.items);
+  const total  = calcTotal(form.items);
+  const p      = periodOf(form.items);
+
+  const myInvoices = form.memberId
+    ? sortByTsDesc(invoices.filter((v) => v.memberId === form.memberId)).slice(0, 8)
+    : [];
+
+  const noMaster = members.length === 0;
+
+  return (
+    <div>
+      {noMaster ? (
+        <div style={{ ...S.card, background: "#fff8e1", border: "1px solid #ffd54f" }}>
+          <div style={{ fontWeight: 700, color: "#8a6d00", marginBottom: 6 }}>⚠️ まだ準備ができていません</div>
+          <div style={{ fontSize: 14, lineHeight: 1.8, color: "#6b5600" }}>
+            管理者の方が、右上の「🔒 管理者」からマスター管理を開いて<br />
+            <b>入力者・トレーニング名・リージョン</b>を登録してください。
+          </div>
+        </div>
+      ) : null}
+
+      {/* 保存完了バナー */}
+      {saved ? (
+        <div className="fade-in" style={{ ...S.card, background: "#e6f6ec", border: "1.5px solid #1b7f43" }}>
+          <div style={{ fontWeight: 700, color: "#1b7f43", fontSize: 16, marginBottom: 6 }}>
+            ✅ 請求書を登録しました（{saved.docNumber}）
+          </div>
+          <div style={{ fontSize: 14, color: "#28603f", marginBottom: 14, lineHeight: 1.8 }}>
+            合計 <b>¥{fmt(calcTotal(saved.items))}</b>／{filledOf(saved.items).length}件。
+            下のボタンからPDFを保存して保管してください。
+          </div>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <button style={S.btn("#1b7f43")} onClick={() => onPrint(saved)}>🖨 PDFを表示・保存する</button>
+            <button style={S.ghost} onClick={onReset}>🧹 新しく入力する</button>
+          </div>
+        </div>
+      ) : null}
+
+      {/* 基本情報 */}
+      <div style={S.card}>
+        <div style={S.h2}>① あなた（請求元）を選んでください</div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(240px,1fr))", gap: 14 }}>
+          <Field label="入力者（請求元）">
+            <select value={form.memberId} onChange={(e) => setField("memberId", e.target.value)}>
+              <option value="">— 選んでください —</option>
+              {members.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+            </select>
+          </Field>
+          <Field label="入力日" hint="今日の日付が入っています。変更もできます。">
+            <input type="date" value={form.createdAt} onChange={(e) => setField("createdAt", e.target.value)} />
+          </Field>
+        </div>
+        {member ? (
+          <div style={{ background: "#f7f8fa", borderRadius: 9, padding: "12px 14px", fontSize: 13, lineHeight: 1.9, color: "#444" }}>
+            <div style={{ fontWeight: 700, color: NAVY, marginBottom: 3 }}>請求書に載る情報（マスター登録内容）</div>
+            <div>住所：{member.address || <span style={{ color: "#aaa" }}>未登録</span>}</div>
+            <div>TEL：{member.tel || <span style={{ color: "#aaa" }}>未登録</span>}</div>
+            <div>振込先：{member.bank || <span style={{ color: "#aaa" }}>未登録</span>}</div>
+            {member.invoiceNo ? <div>登録番号：{member.invoiceNo}</div> : null}
+            <div style={{ ...S.tiny, marginTop: 5 }}>※ 内容が違うときは管理者に連絡してください。</div>
+          </div>
+        ) : null}
+      </div>
+
+      {/* 明細 */}
+      <div style={S.card}>
+        <div style={S.h2}>
+          ② 受講したトレーニングをまとめて入力
+          <span style={{ ...S.tiny, fontWeight: 400 }}>（過去6か月分／使わない行は空のままでOK）</span>
+        </div>
+
+        <div className="item-head">
+          <div style={{ textAlign: "center" }}>No</div>
+          <div>受講日</div>
+          <div>トレーニング名</div>
+          <div>リージョン</div>
+          <div style={{ textAlign: "right" }}>受講料金（円）</div>
+          <div></div>
+        </div>
+        <div style={{ border: "1px solid #e6e9ed", borderTop: "none", borderRadius: "0 0 8px 8px", overflow: "hidden" }}>
+          {form.items.map((it, i) => (
+            <ItemRow key={it.id} item={it} idx={i} trainings={trainings} regions={regions}
+                     onChange={setItem} onClear={clearItem} />
+          ))}
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 14, flexWrap: "wrap" }}>
+          <button style={S.ghost} onClick={addRow}>＋ 行を追加</button>
+          <div style={{ flex: 1 }} />
+          <div style={{ textAlign: "right" }}>
+            <div style={S.tiny}>入力済み {filled.length} 件{p.from ? "／対象期間 " + fmtSlash(p.from) + " 〜 " + fmtSlash(p.to) : ""}</div>
+            <div style={{ fontSize: 22, fontWeight: 700, color: NAVY }}>合計 ¥{fmt(total)}</div>
+          </div>
+        </div>
+      </div>
+
+      {/* 備考・保存 */}
+      <div style={S.card}>
+        <div style={S.h2}>③ 内容を確認して登録</div>
+        <Field label="備考（任意）">
+          <textarea rows="2" value={form.note} onChange={(e) => setField("note", e.target.value)}
+                    placeholder="補足があれば記入してください" />
+        </Field>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+          <button style={S.btn(RED)} onClick={onSave}>💾 この内容で請求書を登録する</button>
+          <button style={S.ghost} onClick={onReset}>🧹 入力をやり直す</button>
+          <div style={{ flex: 1 }} />
+          <span style={S.tiny}>
+            {fbStatus === "online" ? "☁ クラウド保存できます" : "⚠ オフライン：この端末にだけ保存されます"}
+          </span>
+        </div>
+      </div>
+
+      {/* 自分の過去の請求書 */}
+      {form.memberId ? (
+        <div style={S.card}>
+          <div style={S.h2}>📄 あなたが登録した請求書</div>
+          {myInvoices.length === 0 ? (
+            <div style={S.tiny}>まだ登録がありません。</div>
+          ) : (
+            <div className="tbl-wrap">
+              <table className="hist">
+                <thead><tr>
+                  <th style={{ width: 110 }}>状態</th><th>請求書番号</th><th>請求日</th>
+                  <th style={{ textAlign: "right" }}>合計金額</th><th style={{ width: 110 }}></th>
+                </tr></thead>
+                <tbody>
+                  {myInvoices.map((v) => (
+                    <tr key={v.id}>
+                      <td><StatusBadge status={v.status} small /></td>
+                      <td style={{ fontWeight: 700 }}>{v.docNumber}</td>
+                      <td>{fmtSlash(v.createdAt)}</td>
+                      <td style={{ textAlign: "right", fontWeight: 700 }}>¥{fmt(calcTotal(v.items))}</td>
+                      <td><button style={{ ...S.ghost, padding: "6px 12px", fontSize: 13 }} onClick={() => onPrint(v)}>🖨 PDF</button></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/* ============================================================
+   管理者：履歴画面
+   ============================================================ */
+function HistoryPanel({ invoices, masters, onView, onToggle }) {
+  const [fMember, setFMember] = useState("");
+  const [fStatus, setFStatus] = useState("");
+  const [fMonth,  setFMonth]  = useState("");
+  const members = masters.members || [];
+
+  const list = useMemo(() => {
+    return sortByTsDesc(invoices).filter((v) => {
+      if (fMember && v.memberId !== fMember) return false;
+      if (fStatus && (v.status || "unpaid") !== fStatus) return false;
+      if (fMonth && String(v.createdAt || "").slice(0, 7) !== fMonth) return false;
+      return true;
+    });
+  }, [invoices, fMember, fStatus, fMonth]);
+
+  const sumAll    = list.reduce((s, v) => s + calcTotal(v.items), 0);
+  const sumUnpaid = list.filter((v) => (v.status || "unpaid") !== "paid").reduce((s, v) => s + calcTotal(v.items), 0);
+  const sumPaid   = sumAll - sumUnpaid;
+
+  const months = useMemo(() => {
+    const set = {};
+    invoices.forEach((v) => { const m = String(v.createdAt || "").slice(0, 7); if (m) set[m] = 1; });
+    return Object.keys(set).sort().reverse();
+  }, [invoices]);
+
+  const Tile = ({ label, value, color, bg }) => (
+    <div style={{ background: bg, borderRadius: 10, padding: "14px 16px", flex: "1 1 180px", minWidth: 160 }}>
+      <div style={{ fontSize: 12, fontWeight: 700, color: "#6b7280", marginBottom: 4 }}>{label}</div>
+      <div style={{ fontSize: 21, fontWeight: 700, color: color }}>{value}</div>
+    </div>
+  );
+
+  return (
+    <div>
+      <div style={S.card}>
+        <div style={S.h2}>💰 請求額のまとめ<span style={{ ...S.tiny, fontWeight: 400 }}>（下の絞り込み結果に連動します）</span></div>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          <Tile label="件数" value={list.length + " 件"} color={NAVY} bg="#f2f4f7" />
+          <Tile label="🔴 未払い 合計" value={"¥" + fmt(sumUnpaid)} color={RED} bg="#fdecef" />
+          <Tile label="🟢 支払い済 合計" value={"¥" + fmt(sumPaid)} color="#1b7f43" bg="#e6f6ec" />
+          <Tile label="総額" value={"¥" + fmt(sumAll)} color={NAVY} bg="#eef1f6" />
+        </div>
+      </div>
+
+      <div style={S.card}>
+        <div style={S.h2}>🔎 絞り込み</div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(200px,1fr))", gap: 12 }}>
+          <Field label="請求元">
+            <select value={fMember} onChange={(e) => setFMember(e.target.value)}>
+              <option value="">すべて</option>
+              {members.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+            </select>
+          </Field>
+          <Field label="支払い状態">
+            <select value={fStatus} onChange={(e) => setFStatus(e.target.value)}>
+              <option value="">すべて</option>
+              <option value="unpaid">🔴 未払い</option>
+              <option value="paid">🟢 支払い済</option>
+            </select>
+          </Field>
+          <Field label="請求日（年月）">
+            <select value={fMonth} onChange={(e) => setFMonth(e.target.value)}>
+              <option value="">すべて</option>
+              {months.map((m) => <option key={m} value={m}>{m.replace("-", "年") + "月"}</option>)}
+            </select>
+          </Field>
+        </div>
+      </div>
+
+      <div style={S.card}>
+        <div style={S.h2}>📚 請求書の履歴<span style={{ ...S.tiny, fontWeight: 400 }}>（状態のバッジを押すと支払い登録ができます）</span></div>
+        {list.length === 0 ? (
+          <div style={S.tiny}>該当する請求書はありません。</div>
+        ) : (
+          <div className="tbl-wrap">
+            <table className="hist">
+              <thead><tr>
+                <th style={{ width: 120 }}>状態</th>
+                <th>請求書番号</th>
+                <th>請求元</th>
+                <th>請求日</th>
+                <th>対象期間</th>
+                <th style={{ textAlign: "center" }}>件数</th>
+                <th style={{ textAlign: "right" }}>合計金額</th>
+                <th style={{ width: 90 }}></th>
+              </tr></thead>
+              <tbody>
+                {list.map((v) => {
+                  const p = periodOf(v.items);
+                  return (
+                    <tr key={v.id}>
+                      <td><StatusBadge status={v.status} small onClick={() => onToggle(v)} /></td>
+                      <td style={{ fontWeight: 700, whiteSpace: "nowrap" }}>{v.docNumber}</td>
+                      <td style={{ whiteSpace: "nowrap" }}>{v.memberName}</td>
+                      <td style={{ whiteSpace: "nowrap" }}>{fmtSlash(v.createdAt)}</td>
+                      <td style={{ whiteSpace: "nowrap", fontSize: 13, color: "#666" }}>
+                        {p.from ? fmtSlash(p.from) + " 〜 " + fmtSlash(p.to) : "—"}
+                      </td>
+                      <td style={{ textAlign: "center" }}>{filledOf(v.items).length}</td>
+                      <td style={{ textAlign: "right", fontWeight: 700 }}>¥{fmt(calcTotal(v.items))}</td>
+                      <td>
+                        <button style={{ ...S.ghost, padding: "6px 12px", fontSize: 13 }} onClick={() => onView(v)}>閲覧</button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   管理者：詳細モーダル
+   ============================================================ */
+function DetailModal({ inv, onClose, onPrint, onToggle, onDelete }) {
+  if (!inv) return null;
+  const items = filledOf(inv.items);
+  const p = periodOf(inv.items);
+  return (
+    <div style={S.modalBg} onClick={onClose}>
+      <div className="fade-in" onClick={(e) => e.stopPropagation()}
+        style={{ background: "#fff", borderRadius: 14, width: "100%", maxWidth: 820, maxHeight: "90vh", overflowY: "auto", padding: 22 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 14, flexWrap: "wrap" }}>
+          <div style={{ fontSize: 18, fontWeight: 700, color: NAVY }}>{inv.docNumber}</div>
+          <StatusBadge status={inv.status} />
+          <div style={{ flex: 1 }} />
+          <button style={S.ghost} onClick={onClose}>✕ 閉じる</button>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(220px,1fr))", gap: 12, marginBottom: 16 }}>
+          <div style={{ background: "#f7f8fa", borderRadius: 9, padding: 12, fontSize: 13, lineHeight: 1.9 }}>
+            <div style={{ fontWeight: 700, color: NAVY, marginBottom: 3 }}>請求元</div>
+            <div style={{ fontWeight: 700, fontSize: 15 }}>{inv.memberName}</div>
+            <div>{inv.memberAddress || "—"}</div>
+            <div>TEL: {inv.memberTel || "—"}</div>
+            <div>振込先: {inv.memberBank || "—"}</div>
+            {inv.memberInvoiceNo ? <div>登録番号: {inv.memberInvoiceNo}</div> : null}
+          </div>
+          <div style={{ background: "#f7f8fa", borderRadius: 9, padding: 12, fontSize: 13, lineHeight: 1.9 }}>
+            <div style={{ fontWeight: 700, color: NAVY, marginBottom: 3 }}>請求内容</div>
+            <div>請求日: {fmtJP(inv.createdAt)}</div>
+            <div>対象期間: {p.from ? fmtJP(p.from) + " 〜 " + fmtJP(p.to) : "—"}</div>
+            <div>件数: {items.length} 件</div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: RED, marginTop: 3 }}>合計 ¥{fmt(calcTotal(inv.items))}</div>
+            {inv.paidAt ? <div style={{ color: "#1b7f43" }}>支払い登録日: {fmtSlash(inv.paidAt)}</div> : null}
+          </div>
+        </div>
+
+        <div className="tbl-wrap" style={{ marginBottom: 14 }}>
+          <table className="hist" style={{ minWidth: 620 }}>
+            <thead><tr>
+              <th style={{ width: 40, textAlign: "center" }}>No</th>
+              <th style={{ width: 110 }}>受講日</th>
+              <th>トレーニング名</th>
+              <th style={{ width: 140 }}>リージョン</th>
+              <th style={{ width: 110, textAlign: "right" }}>料金</th>
+            </tr></thead>
+            <tbody>
+              {items.map((it, i) => (
+                <tr key={it.id || i}>
+                  <td style={{ textAlign: "center", color: "#999" }}>{i + 1}</td>
+                  <td>{fmtSlash(it.date)}</td>
+                  <td>{it.title}</td>
+                  <td>{it.region}</td>
+                  <td style={{ textAlign: "right", fontWeight: 700 }}>¥{fmt(it.fee)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        {inv.note ? (
+          <div style={{ background: "#f7f8fa", borderRadius: 9, padding: 12, fontSize: 13, marginBottom: 14, whiteSpace: "pre-wrap" }}>
+            <b style={{ color: NAVY }}>備考：</b>{inv.note}
+          </div>
+        ) : null}
+
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <button style={S.btn(inv.status === "paid" ? "#6b7280" : "#1b7f43")} onClick={() => onToggle(inv)}>
+            {inv.status === "paid" ? "🔴 未払いに戻す" : "🟢 支払い済に登録する"}
+          </button>
+          <button style={S.btn(NAVY)} onClick={() => onPrint(inv)}>🖨 PDFを表示</button>
+          <div style={{ flex: 1 }} />
+          <button style={{ ...S.ghost, color: RED, borderColor: "#f0b8c0" }} onClick={() => onDelete(inv)}>🗑 削除</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   管理者：マスター管理
+   ============================================================ */
+function SimpleListEditor({ title, hint, list, onChange }) {
+  const [val, setVal] = useState("");
+  const [editId, setEditId] = useState(null);
+  const [editVal, setEditVal] = useState("");
+
+  const add = () => {
+    const v = val.trim();
+    if (!v) return;
+    onChange(list.concat([{ id: uid(), name: v }]));
+    setVal("");
+  };
+  const move = (i, d) => {
+    const next = list.slice();
+    const j = i + d;
+    if (j < 0 || j >= next.length) return;
+    const tmp = next[i]; next[i] = next[j]; next[j] = tmp;
+    onChange(next);
+  };
+  const remove = (i) => onChange(list.filter((_, k) => k !== i));
+  const commit = (i) => {
+    const v = editVal.trim();
+    if (v) {
+      const next = list.slice();
+      next[i] = Object.assign({}, next[i], { name: v });
+      onChange(next);
+    }
+    setEditId(null);
+  };
+
+  return (
+    <div style={S.card}>
+      <div style={S.h2}>{title}<span style={{ ...S.tiny, fontWeight: 400 }}>{hint}</span></div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+        <input value={val} onChange={(e) => setVal(e.target.value)} placeholder="新しく追加する名前を入力"
+               onKeyDown={(e) => { if (e.key === "Enter") add(); }} />
+        <button style={S.btn(NAVY)} onClick={add}>＋ 追加</button>
+      </div>
+      {list.length === 0 ? <div style={S.tiny}>まだ登録がありません。</div> : (
+        <div style={{ border: "1px solid #e6e9ed", borderRadius: 8, overflow: "hidden" }}>
+          {list.map((x, i) => (
+            <div key={x.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderBottom: i === list.length - 1 ? "none" : "1px solid #eceef1", background: i % 2 ? "#fafbfc" : "#fff" }}>
+              <span style={{ width: 26, color: "#aaa", fontSize: 13 }}>{i + 1}</span>
+              {editId === x.id ? (
+                <React.Fragment>
+                  <input value={editVal} autoFocus onChange={(e) => setEditVal(e.target.value)}
+                         onKeyDown={(e) => { if (e.key === "Enter") commit(i); }} />
+                  <button style={S.btn("#1b7f43")} onClick={() => commit(i)}>保存</button>
+                  <button style={S.ghost} onClick={() => setEditId(null)}>取消</button>
+                </React.Fragment>
+              ) : (
+                <React.Fragment>
+                  <span style={{ flex: 1, fontSize: 14 }}>{x.name}</span>
+                  <button style={{ ...S.ghost, padding: "5px 9px" }} onClick={() => move(i, -1)} title="上へ">▲</button>
+                  <button style={{ ...S.ghost, padding: "5px 9px" }} onClick={() => move(i, 1)} title="下へ">▼</button>
+                  <button style={{ ...S.ghost, padding: "5px 11px" }} onClick={() => { setEditId(x.id); setEditVal(x.name); }}>✏</button>
+                  <button style={{ ...S.ghost, padding: "5px 11px", color: RED, borderColor: "#f0b8c0" }} onClick={() => remove(i)}>🗑</button>
+                </React.Fragment>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MemberEditor({ list, onChange }) {
+  const BLANK = { id: "", name: "", address: "", tel: "", bank: "", invoiceNo: "" };
+  const [edit, setEdit] = useState(null);
+
+  const save = () => {
+    if (!edit.name.trim()) { alert("氏名は必ず入力してください。"); return; }
+    if (edit.id) {
+      onChange(list.map((m) => (m.id === edit.id ? edit : m)));
+    } else {
+      onChange(list.concat([Object.assign({}, edit, { id: uid() })]));
+    }
+    setEdit(null);
+  };
+  const move = (i, d) => {
+    const next = list.slice();
+    const j = i + d;
+    if (j < 0 || j >= next.length) return;
+    const tmp = next[i]; next[i] = next[j]; next[j] = tmp;
+    onChange(next);
+  };
+  const remove = (m) => {
+    if (!confirm("「" + m.name + "」さんをマスターから削除します。よろしいですか？\n※ すでに登録された請求書は残ります。")) return;
+    onChange(list.filter((x) => x.id !== m.id));
+  };
+
+  return (
+    <div style={S.card}>
+      <div style={S.h2}>👤 入力者（請求元）マスター<span style={{ ...S.tiny, fontWeight: 400 }}>（請求書に載る氏名・住所・振込先）</span></div>
+
+      {edit ? (
+        <div style={{ border: "1.5px solid " + NAVY, borderRadius: 10, padding: 16, marginBottom: 14, background: "#f7f9fc" }}>
+          <div style={{ fontWeight: 700, color: NAVY, marginBottom: 10 }}>{edit.id ? "内容を修正" : "新しく登録"}</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(240px,1fr))", gap: 12 }}>
+            <Field label="氏名（必須）">
+              <input value={edit.name} onChange={(e) => setEdit(Object.assign({}, edit, { name: e.target.value }))} placeholder="例：宮守 洋輔" />
+            </Field>
+            <Field label="電話番号">
+              <input value={edit.tel} onChange={(e) => setEdit(Object.assign({}, edit, { tel: e.target.value }))} placeholder="例：0776-00-0000" />
+            </Field>
+          </div>
+          <Field label="住所">
+            <input value={edit.address} onChange={(e) => setEdit(Object.assign({}, edit, { address: e.target.value }))} placeholder="例：〒910-0000 福井県福井市○○1-2-3" />
+          </Field>
+          <Field label="振込先" hint="銀行名・支店名・口座種別・口座番号・口座名義まで書くと親切です。">
+            <textarea rows="2" value={edit.bank} onChange={(e) => setEdit(Object.assign({}, edit, { bank: e.target.value }))}
+                      placeholder="例：福井銀行 本店営業部 普通 1234567 ミヤモリ ヨウスケ" />
+          </Field>
+          <Field label="インボイス登録番号（任意）">
+            <input value={edit.invoiceNo} onChange={(e) => setEdit(Object.assign({}, edit, { invoiceNo: e.target.value }))} placeholder="例：T1234567890123（登録している方のみ）" />
+          </Field>
+          <div style={{ display: "flex", gap: 10 }}>
+            <button style={S.btn("#1b7f43")} onClick={save}>💾 保存</button>
+            <button style={S.ghost} onClick={() => setEdit(null)}>取消</button>
+          </div>
+        </div>
+      ) : (
+        <button style={S.btn(NAVY)} onClick={() => setEdit(Object.assign({}, BLANK))}>＋ 入力者を追加</button>
+      )}
+
+      <div style={{ marginTop: 14 }}>
+        {list.length === 0 ? <div style={S.tiny}>まだ登録がありません。</div> : (
+          <div style={{ border: "1px solid #e6e9ed", borderRadius: 8, overflow: "hidden" }}>
+            {list.map((m, i) => (
+              <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 12px", borderBottom: i === list.length - 1 ? "none" : "1px solid #eceef1", background: i % 2 ? "#fafbfc" : "#fff", flexWrap: "wrap" }}>
+                <span style={{ width: 26, color: "#aaa", fontSize: 13 }}>{i + 1}</span>
+                <div style={{ flex: "1 1 240px", minWidth: 0 }}>
+                  <div style={{ fontWeight: 700, fontSize: 15 }}>{m.name}</div>
+                  <div style={{ ...S.tiny, lineHeight: 1.7 }}>
+                    {m.address || "住所未登録"}{m.tel ? "／TEL " + m.tel : ""}<br />
+                    振込先：{m.bank || "未登録"}{m.invoiceNo ? "／登録番号 " + m.invoiceNo : ""}
+                  </div>
+                </div>
+                <button style={{ ...S.ghost, padding: "5px 9px" }} onClick={() => move(i, -1)}>▲</button>
+                <button style={{ ...S.ghost, padding: "5px 9px" }} onClick={() => move(i, 1)}>▼</button>
+                <button style={{ ...S.ghost, padding: "5px 11px" }} onClick={() => setEdit(Object.assign({}, m))}>✏ 編集</button>
+                <button style={{ ...S.ghost, padding: "5px 11px", color: RED, borderColor: "#f0b8c0" }} onClick={() => remove(m)}>🗑</button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function MasterPanel({ masters, setMasterKey, fbStatus }) {
+  const settings = masters.settings || EMPTY_MASTERS().settings;
+  const [billTo, setBillTo]   = useState(settings.billTo || "");
+  const [pw, setPw]           = useState(settings.adminPassword || "");
+  const [footer, setFooter]   = useState(settings.footerNote || "");
+  const [savedMsg, setSavedMsg] = useState("");
+
+  useEffect(() => {
+    setBillTo(settings.billTo || "");
+    setPw(settings.adminPassword || "");
+    setFooter(settings.footerNote || "");
+  }, [settings.billTo, settings.adminPassword, settings.footerNote]);
+
+  const saveSettings = () => {
+    setMasterKey("settings", { billTo: billTo, adminPassword: pw, footerNote: footer });
+    setSavedMsg("保存しました");
+    setTimeout(() => setSavedMsg(""), 2500);
+  };
+
+  return (
+    <div>
+      <div style={{ ...S.card, background: "#eef1f6" }}>
+        <div style={{ fontSize: 14, lineHeight: 1.9, color: "#3a4252" }}>
+          ここで登録した内容が、入力画面の選択肢になります。<br />
+          変更すると<b>すぐに全員の画面へ反映</b>されます{fbStatus === "online" ? "" : "（※いまオフラインのため、この端末だけの変更です）"}。
+        </div>
+      </div>
+
+      <MemberEditor list={masters.members || []} onChange={(v) => setMasterKey("members", v)} />
+
+      <SimpleListEditor
+        title="📘 トレーニング名マスター"
+        hint="（入力画面のプルダウンに出ます）"
+        list={masters.trainings || []}
+        onChange={(v) => setMasterKey("trainings", v)} />
+
+      <SimpleListEditor
+        title="🗾 リージョンマスター"
+        hint="（トレーニングを提供しているリージョン）"
+        list={masters.regions || []}
+        onChange={(v) => setMasterKey("regions", v)} />
+
+      <div style={S.card}>
+        <div style={S.h2}>⚙️ 請求書と管理者の設定</div>
+        <Field label="請求書の宛先">
+          <input value={billTo} onChange={(e) => setBillTo(e.target.value)} placeholder="例：BNI 福井 御中" />
+        </Field>
+        <Field label="請求書の下部に入れる文言（任意）">
+          <textarea rows="2" value={footer} onChange={(e) => setFooter(e.target.value)} placeholder="例：振込手数料は貴社にてご負担ください。" />
+        </Field>
+        <Field label="管理者パスワード" hint="空欄のままにすると、初期パスワードのままになります。">
+          <input value={pw} onChange={(e) => setPw(e.target.value)} placeholder="変更したいパスワードを入力" />
+        </Field>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <button style={S.btn("#1b7f43")} onClick={saveSettings}>💾 設定を保存</button>
+          {savedMsg ? <span style={{ color: "#1b7f43", fontWeight: 700, fontSize: 14 }}>✅ {savedMsg}</span> : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   管理者ログイン
+   ============================================================ */
+function AdminGate({ expected, onOk, onClose }) {
+  const [val, setVal] = useState("");
+  const [err, setErr] = useState(false);
+  const submit = () => {
+    if (val === expected) { onOk(); }
+    else { setErr(true); setVal(""); }
+  };
+  return (
+    <div style={S.modalBg} onClick={onClose}>
+      <div style={S.modal} className="fade-in" onClick={(e) => e.stopPropagation()}>
+        <div style={{ fontSize: 18, fontWeight: 700, color: NAVY, marginBottom: 6 }}>🔒 管理者パスワード</div>
+        <div style={{ ...S.tiny, marginBottom: 14 }}>管理者の方のみご利用ください。</div>
+        <input type="password" value={val} autoFocus placeholder="パスワードを入力"
+               onChange={(e) => { setVal(e.target.value); setErr(false); }}
+               onKeyDown={(e) => { if (e.key === "Enter") submit(); }} />
+        {err ? <div style={{ color: RED, fontSize: 13, fontWeight: 700, marginTop: 8 }}>パスワードが違います。</div> : null}
+        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 18 }}>
+          <button style={S.ghost} onClick={onClose}>閉じる</button>
+          <button style={S.btn(NAVY)} onClick={submit}>入る</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   App
+   ============================================================ */
+function App() {
+  const [masters,  setMasters]  = useState(() => loadLS(LS.masters, EMPTY_MASTERS()));
+  const [invoices, setInvoices] = useState(() => loadLS(LS.invoices, []));
+  const [fbStatus, setFbStatus] = useState("connecting");
+  const [db, setDb]             = useState(null);
+
+  const [tab, setTab]           = useState("entry");
+  const [isAdmin, setIsAdmin]   = useState(false);
+  const [gate, setGate]         = useState(false);
+
+  const [form, setForm]         = useState(EMPTY_FORM);
+  const [saved, setSaved]       = useState(null);
+  const [viewInv, setViewInv]   = useState(null);
+  const [printHTML, setPrintHTML] = useState(null);
+  const [confirmData, setConfirmData] = useState(null);
+
+  const adminPassword = (masters.settings && masters.settings.adminPassword) || DEFAULT_ADMIN_PASSWORD;
+
+  /* --- Firebase 接続・購読 --- */
+  useEffect(() => {
+    let unsubA = null, unsubB = null;
+    loadFirebase().then((d) => {
+      setDb(d);
+      setFbStatus("online");
+
+      unsubA = d.collection(COL.invoices).onSnapshot(
+        (snap) => {
+          const arr = snap.docs.map((x) => Object.assign({}, x.data(), { _fbId: x.id }));
+          setInvoices(sortByTsDesc(arr));
+          saveLS(LS.invoices, arr);
+        },
+        () => setFbStatus("offline")
+      );
+
+      unsubB = d.collection(COL.masters).onSnapshot(
+        (snap) => {
+          const base = EMPTY_MASTERS();
+          snap.forEach((x) => { base[x.id] = x.data().value; });
+          if (!base.settings) base.settings = EMPTY_MASTERS().settings;
+          setMasters(base);
+          saveLS(LS.masters, base);
+        },
+        () => setFbStatus("offline")
+      );
+    }).catch(() => setFbStatus("offline"));
+
+    return () => { if (unsubA) unsubA(); if (unsubB) unsubB(); };
+  }, []);
+
+  /* --- マスター保存 --- */
+  const setMasterKey = (key, value) => {
+    const next = Object.assign({}, masters, { [key]: value });
+    setMasters(next);
+    saveLS(LS.masters, next);
+    if (db) {
+      db.collection(COL.masters).doc(key).set({ value: stripUndefined(value) })
+        .catch(() => setFbStatus("offline"));
+    }
+  };
+
+  /* --- 請求書の保存 --- */
+  const saveInvoice = () => {
+    const member = (masters.members || []).find((m) => m.id === form.memberId);
+    if (!member) { alert("「入力者（請求元）」を選んでください。"); return; }
+
+    const items = filledOf(form.items);
+    if (items.length === 0) { alert("トレーニングを1件以上入力してください。"); return; }
+
+    const bad = items.filter((it) => !it.date || !it.title || !(Number(it.fee) > 0));
+    if (bad.length > 0) {
+      alert("入力もれがあります。\n受講日・トレーニング名・受講料金は、入力した行すべてに必要です。\n（" + bad.length + "行）");
+      return;
+    }
+
+    const docNumber = makeDocNumber(invoices, form.createdAt);
+    const inv = {
+      id: uid(),
+      docNumber: docNumber,
+      createdAt: form.createdAt,
+      memberId: member.id,
+      memberName: member.name || "",
+      memberAddress: member.address || "",
+      memberTel: member.tel || "",
+      memberBank: member.bank || "",
+      memberInvoiceNo: member.invoiceNo || "",
+      items: items.map((it) => ({ id: it.id, date: it.date, title: it.title, region: it.region, fee: Number(it.fee) || 0 })),
+      total: calcTotal(items),
+      note: form.note || "",
+      status: "unpaid",
+      paidAt: null,
+      _ts: Date.now(),
+    };
+
+    const next = [inv].concat(invoices);
+    setInvoices(next);
+    saveLS(LS.invoices, next);
+    if (db) {
+      db.collection(COL.invoices).doc(inv.id).set(stripUndefined(inv))
+        .catch(() => setFbStatus("offline"));
+    }
+    setSaved(inv);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  /* --- 支払い状態の切り替え --- */
+  const toggleStatus = (inv) => {
+    const toPaid = (inv.status || "unpaid") !== "paid";
+    setConfirmData({
+      title: toPaid ? "🟢 支払い登録" : "🔴 未払いに戻す",
+      message: toPaid
+        ? (inv.memberName + " さんの請求書\n" + inv.docNumber + "（¥" + fmt(calcTotal(inv.items)) + "）を\n\n「支払い済」に登録しますか？")
+        : (inv.memberName + " さんの請求書\n" + inv.docNumber + "（¥" + fmt(calcTotal(inv.items)) + "）を\n\n「未払い」に戻しますか？"),
+      yesLabel: toPaid ? "支払い済にする" : "未払いに戻す",
+      color: toPaid ? "#1b7f43" : RED,
+      onYes: () => {
+        const patch = { status: toPaid ? "paid" : "unpaid", paidAt: toPaid ? todayStr() : null };
+        const next = invoices.map((v) => (v.id === inv.id ? Object.assign({}, v, patch) : v));
+        setInvoices(next);
+        saveLS(LS.invoices, next);
+        if (db) db.collection(COL.invoices).doc(inv.id).set(patch, { merge: true }).catch(() => setFbStatus("offline"));
+        if (viewInv && viewInv.id === inv.id) setViewInv(Object.assign({}, viewInv, patch));
+      },
+    });
+  };
+
+  /* --- 削除（管理者のみ） --- */
+  const deleteInvoice = (inv) => {
+    setConfirmData({
+      title: "🗑 請求書を削除",
+      message: inv.docNumber + "（" + inv.memberName + " さん・¥" + fmt(calcTotal(inv.items)) + "）を削除します。\n\nこの操作は元に戻せません。よろしいですか？",
+      yesLabel: "削除する",
+      color: RED,
+      onYes: () => {
+        const next = invoices.filter((v) => v.id !== inv.id);
+        setInvoices(next);
+        saveLS(LS.invoices, next);
+        if (db) db.collection(COL.invoices).doc(inv.id).delete().catch(() => setFbStatus("offline"));
+        setViewInv(null);
+      },
+    });
+  };
+
+  const printInvoice = (inv) => setPrintHTML(buildInvoiceHTML(inv, masters.settings || {}));
+
+  const resetForm = () => { setForm(EMPTY_FORM()); setSaved(null); window.scrollTo({ top: 0, behavior: "smooth" }); };
+
+  const openAdmin = () => { if (isAdmin) setTab("history"); else setGate(true); };
+
+  const TabBtn = ({ id, label }) => (
+    <button onClick={() => setTab(id)}
+      style={{
+        background: tab === id ? "#fff" : "transparent",
+        color: tab === id ? NAVY : "#ffffffcc",
+        borderRadius: "9px 9px 0 0", padding: "11px 20px", fontWeight: 700, fontSize: 14,
+      }}>
+      {label}
+    </button>
+  );
+
+  const statusDot = fbStatus === "online" ? "#3ddc84" : (fbStatus === "connecting" ? "#f5c518" : "#ff6b6b");
+  const statusText = fbStatus === "online" ? "クラウド接続中" : (fbStatus === "connecting" ? "接続中…" : "オフライン");
+
+  return (
+    <div>
+      {/* ヘッダー */}
+      <div style={{ background: "linear-gradient(135deg," + RED + " 0%, #9c0d24 55%," + NAVY + " 100%)", color: "#fff", paddingTop: 16 }}>
+        <div style={{ maxWidth: 1140, margin: "0 auto", padding: "0 14px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
+            <div>
+              <div style={{ fontSize: 19, fontWeight: 700, letterSpacing: "0.04em" }}>BNI トレーニング受講料　請求システム</div>
+              <div style={{ fontSize: 12, color: "#ffffffb0", marginTop: 2 }}>
+                DnAチーム ／ {APP_VERSION}
+                <span style={{ marginLeft: 12, display: "inline-flex", alignItems: "center", gap: 5 }}>
+                  <span style={{ width: 8, height: 8, borderRadius: 99, background: statusDot, display: "inline-block" }}></span>
+                  {statusText}
+                </span>
+              </div>
+            </div>
+            <div style={{ flex: 1 }} />
+            {isAdmin ? (
+              <button onClick={() => { setIsAdmin(false); setTab("entry"); }}
+                style={{ background: "#ffffff22", color: "#fff", border: "1px solid #ffffff55", borderRadius: 8, padding: "8px 14px", fontWeight: 700, fontSize: 13 }}>
+                🔓 管理者モードを終了
+              </button>
+            ) : (
+              <button onClick={openAdmin}
+                style={{ background: "#ffffff22", color: "#fff", border: "1px solid #ffffff55", borderRadius: 8, padding: "8px 14px", fontWeight: 700, fontSize: 13 }}>
+                🔒 管理者
+              </button>
+            )}
+          </div>
+          <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+            <TabBtn id="entry" label="📝 請求書を入力する" />
+            {isAdmin ? <TabBtn id="history" label="📚 履歴・支払い管理" /> : null}
+            {isAdmin ? <TabBtn id="master" label="⚙️ マスター管理" /> : null}
+          </div>
+        </div>
+      </div>
+
+      {/* 本体 */}
+      <div style={S.page}>
+        <div style={{ height: 18 }} />
+        {tab === "entry" ? (
+          <EntryPanel form={form} setForm={setForm} masters={masters} invoices={invoices}
+                      onSave={saveInvoice} onPrint={printInvoice} saved={saved}
+                      onReset={resetForm} fbStatus={fbStatus} />
+        ) : null}
+        {tab === "history" && isAdmin ? (
+          <HistoryPanel invoices={invoices} masters={masters} onView={setViewInv} onToggle={toggleStatus} />
+        ) : null}
+        {tab === "master" && isAdmin ? (
+          <MasterPanel masters={masters} setMasterKey={setMasterKey} fbStatus={fbStatus} />
+        ) : null}
+      </div>
+
+      {/* モーダル類 */}
+      {gate ? (
+        <AdminGate expected={adminPassword}
+                   onOk={() => { setIsAdmin(true); setGate(false); setTab("history"); }}
+                   onClose={() => setGate(false)} />
+      ) : null}
+
+      <DetailModal inv={viewInv} onClose={() => setViewInv(null)} onPrint={printInvoice}
+                   onToggle={toggleStatus} onDelete={deleteInvoice} />
+
+      <ConfirmDialog data={confirmData} onClose={() => setConfirmData(null)} />
+
+      {/* PDFプレビュー */}
+      {printHTML ? (
+        <div style={{ position: "fixed", inset: 0, background: "#000a", zIndex: 4000, display: "flex", flexDirection: "column" }}>
+          <div style={{ background: NAVY, color: "#fff", padding: "10px 16px", display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap", flexShrink: 0 }}>
+            <span style={{ fontWeight: 700, fontSize: 14 }}>🖨 請求書プレビュー</span>
+            <span style={{ fontSize: 12, color: "#ffffffaa" }}>印刷画面で「PDFとして保存」を選ぶと保管できます</span>
+            <div style={{ flex: 1 }} />
+            <button onClick={() => {
+                const f = document.getElementById("pdf-iframe");
+                if (f) { f.contentWindow.focus(); f.contentWindow.print(); }
+              }}
+              style={{ background: "#fff", color: NAVY, borderRadius: 7, padding: "8px 18px", fontWeight: 700, fontSize: 14 }}>
+              🖨 印刷 / PDFで保存
+            </button>
+            <button onClick={() => setPrintHTML(null)}
+              style={{ background: "transparent", color: "#fff", border: "1px solid #ffffff66", borderRadius: 7, padding: "8px 16px", fontWeight: 700, fontSize: 14 }}>
+              ✕ 閉じる
+            </button>
+          </div>
+          <iframe id="pdf-iframe" srcDoc={printHTML} title="請求書プレビュー"
+                  style={{ flex: 1, border: "none", background: "#888" }} />
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+</script>
+</body>
+</html>
