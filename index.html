@@ -88,7 +88,7 @@ const { useState, useEffect, useMemo } = React;
    ・管理者：パスワードで入り、履歴の閲覧と「未払い／支払い済」管理
    ============================================================ */
 
-const APP_VERSION = "Ver1-004";
+const APP_VERSION = "Ver1-005";
 
 /* ------------------------------------------------------------
    ★ 管理者パスワードの初期値（マスター管理画面から変更できます）
@@ -277,6 +277,67 @@ async function migrateMasters(db) {
     batch.delete(oldRef);
     await batch.commit();
   }
+}
+
+/* ============================================================
+   CSV 書き出し
+   ・Excel で開いても文字化けしないよう UTF-8 の BOM を先頭に付ける
+   ・「=」「+」等で始まる値はExcelが式として実行してしまうため無効化する
+   ============================================================ */
+function csvCell(v) {
+  let s = (v === null || v === undefined) ? "" : String(v);
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;      // 数式インジェクション対策
+  return '"' + s.replace(/"/g, '""') + '"';
+}
+function toCSV(headers, rows) {
+  const lines = [headers.map(csvCell).join(",")];
+  rows.forEach((r) => lines.push(r.map(csvCell).join(",")));
+  return lines.join("\r\n");
+}
+function downloadCSV(filename, csvText) {
+  const bom = new Uint8Array([0xEF, 0xBB, 0xBF]);   // Excel用のおまじない
+  const blob = new Blob([bom, csvText], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+const statusLabel = (s) => (s === "paid" ? "支払い済" : "未払い");
+
+// ① 明細ごと（トレーニング1件＝1行）：集計・経理向き
+function csvDetail(list) {
+  const headers = ["請求書番号", "支払い状態", "支払い登録日", "請求日", "請求元", "住所", "電話番号",
+                   "振込先", "登録番号", "No", "受講日", "トレーニング名", "リージョン", "受講料金", "請求書合計", "備考", "番号が仮"];
+  const rows = [];
+  list.forEach((v) => {
+    const items = filledOf(v.items);
+    const total = calcTotal(v.items);
+    items.forEach((it, i) => {
+      rows.push([v.docNumber, statusLabel(v.status), v.paidAt || "", v.createdAt, v.memberName,
+                 v.memberAddress || "", v.memberTel || "", v.memberBank || "", v.memberInvoiceNo || "",
+                 i + 1, it.date, it.title, it.region, Number(it.fee) || 0, total, v.note || "",
+                 v.numberProvisional ? "仮" : ""]);
+    });
+  });
+  return toCSV(headers, rows);
+}
+
+// ② 請求書ごと（1請求書＝1行）：支払い管理向き
+function csvSummary(list) {
+  const headers = ["請求書番号", "支払い状態", "支払い登録日", "請求日", "請求元", "住所", "電話番号",
+                   "振込先", "登録番号", "対象期間(開始)", "対象期間(終了)", "件数", "合計金額", "備考", "番号が仮"];
+  const rows = list.map((v) => {
+    const p = periodOf(v.items);
+    return [v.docNumber, statusLabel(v.status), v.paidAt || "", v.createdAt, v.memberName,
+            v.memberAddress || "", v.memberTel || "", v.memberBank || "", v.memberInvoiceNo || "",
+            p.from, p.to, filledOf(v.items).length, calcTotal(v.items), v.note || "",
+            v.numberProvisional ? "仮" : ""];
+  });
+  return toCSV(headers, rows);
 }
 
 /* localStorage（オフライン時の予備・クラウドが本命） */
@@ -790,6 +851,32 @@ function HistoryPanel({ invoices, masters, onView, onToggle }) {
               {months.map((m) => <option key={m} value={m}>{m.replace("-", "年") + "月"}</option>)}
             </select>
           </Field>
+        </div>
+      </div>
+
+      <div style={S.card}>
+        <div style={S.h2}>📤 CSVで書き出す<span style={{ ...S.tiny, fontWeight: 400 }}>（Excelでそのまま開けます）</span></div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center", marginBottom: 10 }}>
+          <button style={S.btn("#1b7f43")}
+            onClick={() => downloadCSV("BNIトレーニング請求_明細_" + todayStr() + ".csv", csvDetail(list))}>
+            📄 明細ごと（{list.reduce((s, v) => s + filledOf(v.items).length, 0)}行）
+          </button>
+          <button style={S.btn(NAVY)}
+            onClick={() => downloadCSV("BNIトレーニング請求_一覧_" + todayStr() + ".csv", csvSummary(list))}>
+            📋 請求書ごと（{list.length}行）
+          </button>
+          {list.length !== invoices.length ? (
+            <button style={S.ghost}
+              onClick={() => downloadCSV("BNIトレーニング請求_全件明細_" + todayStr() + ".csv", csvDetail(sortByTsDesc(invoices)))}>
+              📦 絞り込みを無視して全件
+            </button>
+          ) : null}
+        </div>
+        <div style={{ ...S.tiny, lineHeight: 1.9 }}>
+          ・<b>明細ごと</b>＝トレーニング1件が1行。合計や集計をするときはこちら<br />
+          ・<b>請求書ごと</b>＝請求書1枚が1行。支払い管理・振込作業をするときはこちら<br />
+          ・上の絞り込み（請求元・状態・年月）を反映した内容が出ます<br />
+          ・<span style={{ color: RED, fontWeight: 700 }}>振込先などの個人情報が入ります。</span>保存先とメール添付にご注意ください
         </div>
       </div>
 
