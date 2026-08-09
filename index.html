@@ -88,7 +88,7 @@ const { useState, useEffect, useMemo } = React;
    ・管理者：パスワードで入り、履歴の閲覧と「未払い／支払い済」管理
    ============================================================ */
 
-const APP_VERSION = "Ver1-003";
+const APP_VERSION = "Ver1-004";
 
 /* ------------------------------------------------------------
    ★ 管理者パスワードの初期値（マスター管理画面から変更できます）
@@ -1036,7 +1036,7 @@ function MemberEditor({ list, onChange }) {
           <div style={{ fontWeight: 700, color: NAVY, marginBottom: 10 }}>{edit.id ? "内容を修正" : "新しく登録"}</div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(240px,1fr))", gap: 12 }}>
             <Field label="氏名（必須）">
-              <input value={edit.name} onChange={(e) => setEdit(Object.assign({}, edit, { name: e.target.value }))} placeholder="例：宮守 洋輔" />
+              <input value={edit.name} onChange={(e) => setEdit(Object.assign({}, edit, { name: e.target.value }))} placeholder="例：福井 太郎" />
             </Field>
             <Field label="電話番号">
               <input value={edit.tel} onChange={(e) => setEdit(Object.assign({}, edit, { tel: e.target.value }))} placeholder="例：0776-00-0000" />
@@ -1047,7 +1047,7 @@ function MemberEditor({ list, onChange }) {
           </Field>
           <Field label="振込先" hint="銀行名・支店名・口座種別・口座番号・口座名義まで書くと親切です。">
             <textarea rows="2" value={edit.bank} onChange={(e) => setEdit(Object.assign({}, edit, { bank: e.target.value }))}
-                      placeholder="例：福井銀行 本店営業部 普通 1234567 ミヤモリ ヨウスケ" />
+                      placeholder="例：福井銀行 本店営業部 普通 1234567 フクイ タロウ" />
           </Field>
           <Field label="インボイス登録番号（任意）">
             <input value={edit.invoiceNo} onChange={(e) => setEdit(Object.assign({}, edit, { invoiceNo: e.target.value }))} placeholder="例：T1234567890123（登録している方のみ）" />
