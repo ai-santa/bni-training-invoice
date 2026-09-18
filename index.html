@@ -42,7 +42,7 @@
     /* ---- 明細行のレイアウト（PCは表・スマホはカード） ---- */
     .item-head, .item-row {
       display: grid;
-      grid-template-columns: 38px 150px minmax(0,1fr) 170px 130px 42px;
+      grid-template-columns: 38px 140px minmax(0,1fr) 160px 120px 120px 42px;
       gap: 8px; align-items: center;
     }
     .item-head { padding: 8px 10px; font-size: 12px; font-weight: 700; color: #fff; background: #1f3864; border-radius: 8px 8px 0 0; }
@@ -61,8 +61,9 @@
       .cell-del  { grid-column: 2 / 3; justify-self: end; }
       .cell-date { grid-column: 1 / -1; }
       .cell-ttl  { grid-column: 1 / -1; }
-      .cell-reg  { grid-column: 1 / 2; }
-      .cell-fee  { grid-column: 2 / 3; }
+      .cell-reg  { grid-column: 1 / -1; }
+      .cell-fee  { grid-column: 1 / 2; }
+      .cell-sub  { grid-column: 2 / 3; text-align: left !important; }
       .m-label   { display: block; }
     }
 
@@ -88,7 +89,7 @@ const { useState, useEffect, useMemo } = React;
    ・管理者：パスワードで入り、履歴の閲覧と「未払い／支払い済」管理
    ============================================================ */
 
-const APP_VERSION = "Ver1-005";
+const APP_VERSION = "Ver1-006";
 
 /* ------------------------------------------------------------
    ★ 管理者パスワードの初期値（マスター管理画面から変更できます）
@@ -125,8 +126,9 @@ const COL = {
   members:   "bni_members",
   trainings: "bni_trainings",
   regions:   "bni_regions",
+  roles:     "bni_roles",     // 役職マスター（Ver1-006〜）
 };
-const MASTER_KEYS = ["members", "trainings", "regions"];
+const MASTER_KEYS = ["members", "trainings", "regions", "roles"];
 
 const loadFirebase = (() => {
   let promise = null;
@@ -201,7 +203,8 @@ const EMPTY_MASTERS = () => ({
   members: [],
   trainings: [],
   regions: [],
-  settings: { billTo: "BNI 福井 御中", adminPassword: "", footerNote: "" },
+  roles: [],
+  settings: { billTo: "BNI 福井 御中", adminPassword: "", footerNote: "", rate: 50 },
 });
 
 const EMPTY_FORM = () => ({
@@ -212,6 +215,41 @@ const EMPTY_FORM = () => ({
 const isFilled  = (it) => !!(it.date || it.title || it.region || (it.fee !== "" && it.fee != null));
 const filledOf  = (items) => (items || []).filter(isFilled);
 const calcTotal = (items) => (items || []).reduce((s, it) => s + (Number(it.fee) || 0), 0);
+
+/* ------------------------------------------------------------
+   補助額の計算（Ver1-006〜）
+   ・補助額 ＝ 受講料金 × 補助率（％）の 1円未満切り捨て
+   ・役職が「県外も補助対象」でない人が、「BNI福井開催」の印が無いリージョンを
+     選んだ行は「補助対象外」＝ 0円
+   ・Ver1-005 以前に登録した請求書（calcVersion なし）は、
+     これまでどおり受講料金の合計がそのまま請求額（さかのぼって変えない）
+   ------------------------------------------------------------ */
+const DEFAULT_RATE = 50;
+function rateOf(settings) {
+  const r = Number(settings && settings.rate);
+  return (isFinite(r) && r > 0 && r <= 100) ? r : DEFAULT_RATE;
+}
+function isInPrefRegion(regionName, regions) {
+  const r = (regions || []).find((x) => x.name === regionName);
+  return !!(r && r.inPref);
+}
+function roleOfMember(member, roles) {
+  if (!member || !member.roleId) return null;
+  return (roles || []).find((r) => r.id === member.roleId) || null;
+}
+// ctx = { rate, outOfPrefOk, regions }
+function itemSubsidy(item, ctx) {
+  const fee = Number(item.fee) || 0;
+  const eligible = !!(ctx.outOfPrefOk || isInPrefRegion(item.region, ctx.regions));
+  return { eligible: eligible, subsidy: eligible ? Math.floor(fee * ctx.rate / 100) : 0 };
+}
+const isV2 = (inv) => !!(inv && Number(inv.calcVersion) >= 2);
+// 請求書1枚の請求額（新ルールは補助額の合計、旧ルールは受講料金の合計）
+function invTotal(inv) {
+  const items = filledOf(inv && inv.items);
+  if (isV2(inv)) return items.reduce((s, it) => s + (Number(it.subsidy) || 0), 0);
+  return calcTotal(items);
+}
 function periodOf(items) {
   const ds = (items || []).map((i) => i.date).filter(Boolean).sort();
   return ds.length ? { from: ds[0], to: ds[ds.length - 1] } : { from: "", to: "" };
@@ -279,6 +317,40 @@ async function migrateMasters(db) {
   }
 }
 
+/* Ver1-006 の初期データを1回だけ入れる
+   ・役職マスターが空なら、よく使う4つを入れる（先方で自由に直せる）
+   ・リージョンに「BNI福井開催」の印がまだ1つも無ければ、「BNI福井」に印を付ける
+   ・入れ終わったら bni_masters/_migrations に印を残し、2回目以降は何もしない
+   ・決まったIDで書くので、複数の端末で同時に走っても重複しない */
+const SEED_ROLES = [
+  { id: "role-ambassador", name: "アンバサダー",                     outOfPref: true  },
+  { id: "role-dc",         name: "ディレクターコンサルタント（DC）", outOfPref: true  },
+  { id: "role-admin",      name: "アドミン",                         outOfPref: true  },
+  { id: "role-support",    name: "アンバサダーサポート",             outOfPref: false },
+];
+async function migrateV6(db) {
+  const flagRef = db.collection(COL.masters).doc("_migrations");
+  const flag = await flagRef.get();
+  if (flag.exists && flag.data().v6) return;
+
+  const batch = db.batch();
+  const rolesSnap = await db.collection(COL.roles).limit(1).get();
+  if (rolesSnap.empty) {
+    SEED_ROLES.forEach((r, i) => {
+      batch.set(db.collection(COL.roles).doc(r.id), Object.assign({}, r, { order: i }), { merge: true });
+    });
+  }
+  const regSnap = await db.collection(COL.regions).get();
+  const anyFlag = regSnap.docs.some((d) => Object.prototype.hasOwnProperty.call(d.data(), "inPref"));
+  if (!anyFlag) {
+    regSnap.docs.forEach((d) => {
+      if (String(d.data().name || "").replace(/\s/g, "") === "BNI福井") batch.set(d.ref, { inPref: true }, { merge: true });
+    });
+  }
+  batch.set(flagRef, { v6: true, at: new Date().toISOString() }, { merge: true });
+  await batch.commit();
+}
+
 /* ============================================================
    CSV 書き出し
    ・Excel で開いても文字化けしないよう UTF-8 の BOM を先頭に付ける
@@ -308,19 +380,28 @@ function downloadCSV(filename, csvText) {
 }
 const statusLabel = (s) => (s === "paid" ? "支払い済" : "未払い");
 
+const ruleLabel = (v) => (isV2(v) ? "補助率" + v.rate + "%" : "旧ルール（全額）");
+const roleLabel = (v) => (isV2(v) ? (v.memberRoleName || "") : "");
+const outLabel  = (v) => (isV2(v) ? (v.memberRoleOutOfPref ? "対象" : "対象外") : "");
+
 // ① 明細ごと（トレーニング1件＝1行）：集計・経理向き
 function csvDetail(list) {
-  const headers = ["請求書番号", "支払い状態", "支払い登録日", "請求日", "請求元", "住所", "電話番号",
-                   "振込先", "登録番号", "No", "受講日", "トレーニング名", "リージョン", "受講料金", "請求書合計", "備考", "番号が仮"];
+  const headers = ["請求書番号", "支払い状態", "支払い登録日", "請求日", "請求元", "役職", "県外の補助", "住所", "電話番号",
+                   "振込先", "登録番号", "計算ルール", "No", "受講日", "トレーニング名", "リージョン", "受講料金",
+                   "補助対象", "補助額", "請求書の請求額", "備考", "番号が仮"];
   const rows = [];
   list.forEach((v) => {
     const items = filledOf(v.items);
-    const total = calcTotal(v.items);
+    const total = invTotal(v);
+    const v2 = isV2(v);
     items.forEach((it, i) => {
       rows.push([v.docNumber, statusLabel(v.status), v.paidAt || "", v.createdAt, v.memberName,
+                 roleLabel(v), outLabel(v),
                  v.memberAddress || "", v.memberTel || "", v.memberBank || "", v.memberInvoiceNo || "",
-                 i + 1, it.date, it.title, it.region, Number(it.fee) || 0, total, v.note || "",
-                 v.numberProvisional ? "仮" : ""]);
+                 ruleLabel(v), i + 1, it.date, it.title, it.region, Number(it.fee) || 0,
+                 v2 ? (it.eligible ? "対象" : "対象外") : "対象",
+                 v2 ? (Number(it.subsidy) || 0) : (Number(it.fee) || 0),
+                 total, v.note || "", v.numberProvisional ? "仮" : ""]);
     });
   });
   return toCSV(headers, rows);
@@ -328,13 +409,16 @@ function csvDetail(list) {
 
 // ② 請求書ごと（1請求書＝1行）：支払い管理向き
 function csvSummary(list) {
-  const headers = ["請求書番号", "支払い状態", "支払い登録日", "請求日", "請求元", "住所", "電話番号",
-                   "振込先", "登録番号", "対象期間(開始)", "対象期間(終了)", "件数", "合計金額", "備考", "番号が仮"];
+  const headers = ["請求書番号", "支払い状態", "支払い登録日", "請求日", "請求元", "役職", "県外の補助", "住所", "電話番号",
+                   "振込先", "登録番号", "対象期間(開始)", "対象期間(終了)", "件数", "計算ルール",
+                   "受講料金の合計", "請求額", "備考", "番号が仮"];
   const rows = list.map((v) => {
     const p = periodOf(v.items);
     return [v.docNumber, statusLabel(v.status), v.paidAt || "", v.createdAt, v.memberName,
+            roleLabel(v), outLabel(v),
             v.memberAddress || "", v.memberTel || "", v.memberBank || "", v.memberInvoiceNo || "",
-            p.from, p.to, filledOf(v.items).length, calcTotal(v.items), v.note || "",
+            p.from, p.to, filledOf(v.items).length, ruleLabel(v),
+            calcTotal(filledOf(v.items)), invTotal(v), v.note || "",
             v.numberProvisional ? "仮" : ""];
   });
   return toCSV(headers, rows);
@@ -375,23 +459,54 @@ const S = {
    ============================================================ */
 function buildInvoiceHTML(inv, settings) {
   const items = filledOf(inv.items);
-  const total = calcTotal(items);
+  const v2    = isV2(inv);
+  const total = invTotal(inv);
+  const fees  = calcTotal(items);
   const p     = periodOf(items);
   const rows  = items.slice();
   while (rows.length < 12) rows.push({ date: "", title: "", region: "", fee: "" });
 
+  const TD = 'padding:6px 8px;border-bottom:1px solid #d8dbe0;';
   const bodyRows = rows.map((it, i) => {
     const empty = !isFilled(it);
     const bg = i % 2 === 0 ? "#ffffff" : "#fbfbfc";
+    let subCell = "";
+    if (v2) {
+      subCell = '<td style="' + TD + 'text-align:right;white-space:nowrap;font-weight:700;">'
+        + (empty ? "" : (it.eligible
+            ? "¥ " + fmt(it.subsidy)
+            : '<span style="color:' + RED + ';font-size:8pt;font-weight:700;">補助対象外</span> ¥ 0'))
+        + '</td>';
+    }
     return '<tr style="background:' + bg + ';">'
       + '<td style="padding:6px 6px;border-bottom:1px solid #d8dbe0;text-align:center;color:#666;font-size:9.5pt;">' + (empty ? "" : (i + 1)) + '</td>'
-      + '<td style="padding:6px 8px;border-bottom:1px solid #d8dbe0;white-space:nowrap;">' + (empty ? "" : esc(fmtSlash(it.date))) + '</td>'
-      + '<td style="padding:6px 8px;border-bottom:1px solid #d8dbe0;word-break:break-all;line-height:1.35;">' + esc(it.title) + '</td>'
-      + '<td style="padding:6px 8px;border-bottom:1px solid #d8dbe0;word-break:break-all;">' + esc(it.region) + '</td>'
-      + '<td style="padding:6px 8px;border-bottom:1px solid #d8dbe0;text-align:right;white-space:nowrap;font-weight:' + (empty ? 400 : 700) + ';">'
+      + '<td style="' + TD + 'white-space:nowrap;">' + (empty ? "" : esc(fmtSlash(it.date))) + '</td>'
+      + '<td style="' + TD + 'word-break:break-all;line-height:1.35;">' + esc(it.title) + '</td>'
+      + '<td style="' + TD + 'word-break:break-all;">' + esc(it.region) + '</td>'
+      + '<td style="' + TD + 'text-align:right;white-space:nowrap;font-weight:' + (empty || v2 ? 400 : 700) + ';' + (v2 ? 'color:#555;' : '') + '">'
         + (empty ? "" : "¥ " + fmt(it.fee)) + '</td>'
+      + subCell
       + '</tr>';
   }).join("");
+
+  const colgroup = v2
+    ? '<colgroup><col style="width:24px"><col style="width:70px"><col><col style="width:104px"><col style="width:76px"><col style="width:96px"></colgroup>'
+    : '<colgroup><col style="width:26px"><col style="width:76px"><col><col style="width:120px"><col style="width:86px"></colgroup>';
+  const TH = 'padding:7px 8px;font-size:9pt;';
+  const headRow = '<th style="padding:7px 4px;text-align:center;font-size:9pt;">No</th>'
+    + '<th style="' + TH + 'text-align:left;">受講日</th>'
+    + '<th style="' + TH + 'text-align:left;">トレーニング名</th>'
+    + '<th style="' + TH + 'text-align:left;">リージョン</th>'
+    + '<th style="' + TH + 'text-align:right;">受講料金</th>'
+    + (v2 ? '<th style="' + TH + 'text-align:right;">補助額（' + inv.rate + '%）</th>' : '');
+  const FT = 'padding:9px 8px;text-align:right;font-weight:700;border-top:2px solid ' + NAVY + ';';
+  const footRow = v2
+    ? '<td colspan="4" style="' + FT + 'padding-right:10px;">合　計</td>'
+      + '<td style="' + FT + 'color:#555;font-weight:400;">¥ ' + fmt(fees) + '</td>'
+      + '<td style="' + FT + 'font-size:1.05rem;">¥ ' + fmt(total) + '</td>'
+    : '<td colspan="4" style="' + FT + 'padding-right:10px;">合　計</td>'
+      + '<td style="' + FT + 'font-size:1.05rem;">¥ ' + fmt(total) + '</td>';
+  const ineligibleN = v2 ? items.filter((it) => !it.eligible).length : 0;
 
   const periodText = (p.from && p.to)
     ? (fmtJP(p.from) + " 〜 " + fmtJP(p.to))
@@ -428,6 +543,7 @@ function buildInvoiceHTML(inv, settings) {
 +   '<div style="text-align:right;font-size:0.74rem;line-height:1.85;color:#222;">'
 +     '<div style="font-size:0.62rem;color:#888;letter-spacing:0.1em;">請 求 元</div>'
 +     '<div style="font-weight:700;font-size:1rem;color:#111;margin-bottom:2px;">' + esc(inv.memberName) + '</div>'
++     (v2 && inv.memberRoleName ? '<div style="font-size:0.7rem;color:#555;">役職: ' + esc(inv.memberRoleName) + '</div>' : '')
 +     (inv.memberAddress ? '<div>' + escBr(inv.memberAddress) + '</div>' : '')
 +     (inv.memberTel ? '<div>TEL: ' + esc(inv.memberTel) + '</div>' : '')
 +     (inv.memberInvoiceNo ? '<div style="font-size:0.7rem;color:#555;">登録番号: ' + esc(inv.memberInvoiceNo) + '</div>' : '')
@@ -450,26 +566,24 @@ function buildInvoiceHTML(inv, settings) {
 
 /* 合計 */
 + '<div style="display:flex;align-items:center;gap:14px;background:#fdecef;border:1.5px solid ' + RED + ';border-radius:4px;padding:10px 16px;margin-bottom:14px;">'
-+   '<div style="font-size:0.86rem;font-weight:700;color:' + NAVY + ';letter-spacing:0.06em;">ご請求金額（合計）</div>'
++   '<div style="font-size:0.86rem;font-weight:700;color:' + NAVY + ';letter-spacing:0.06em;">' + (v2 ? 'ご請求金額（補助額の合計）' : 'ご請求金額（合計）') + '</div>'
 +   '<div style="flex:1;text-align:right;font-size:1.5rem;font-weight:700;color:#111;">¥ ' + fmt(total) + '</div>'
 +   '<div style="font-size:0.7rem;color:#666;">（受講 ' + items.length + ' 件）</div>'
 + '</div>'
++ (v2
+    ? '<div style="font-size:0.7rem;color:#555;margin:-8px 0 12px;line-height:1.6;">'
+      + '補助額＝受講料金 × 補助率 ' + inv.rate + '%（1円未満切り捨て）'
+      + (ineligibleN ? '／「補助対象外」の行は、役職の補助範囲（BNI福井開催のみ）の外のため 0円' : '')
+      + '</div>'
+    : '')
 
 /* 明細 */
 + '<div style="font-size:0.82rem;font-weight:700;color:' + NAVY + ';margin-bottom:5px;">■ 受講トレーニング明細</div>'
 + '<table style="width:100%;border-collapse:collapse;font-size:9.5pt;table-layout:fixed;">'
-+   '<colgroup><col style="width:26px"><col style="width:76px"><col><col style="width:120px"><col style="width:86px"></colgroup>'
-+   '<thead><tr style="background:' + NAVY + ';color:#fff;">'
-+     '<th style="padding:7px 4px;text-align:center;font-size:9pt;">No</th>'
-+     '<th style="padding:7px 8px;text-align:left;font-size:9pt;">受講日</th>'
-+     '<th style="padding:7px 8px;text-align:left;font-size:9pt;">トレーニング名</th>'
-+     '<th style="padding:7px 8px;text-align:left;font-size:9pt;">リージョン</th>'
-+     '<th style="padding:7px 8px;text-align:right;font-size:9pt;">受講料金</th>'
-+   '</tr></thead><tbody>' + bodyRows + '</tbody>'
-+   '<tfoot><tr style="background:#f2f4f7;">'
-+     '<td colspan="4" style="padding:9px 10px;text-align:right;font-weight:700;border-top:2px solid ' + NAVY + ';">合　計</td>'
-+     '<td style="padding:9px 8px;text-align:right;font-weight:700;font-size:1.05rem;border-top:2px solid ' + NAVY + ';">¥ ' + fmt(total) + '</td>'
-+   '</tr></tfoot>'
++   colgroup
++   '<thead><tr style="background:' + NAVY + ';color:#fff;">' + headRow + '</tr></thead>'
++   '<tbody>' + bodyRows + '</tbody>'
++   '<tfoot><tr style="background:#f2f4f7;">' + footRow + '</tr></tfoot>'
 + '</table>'
 
 /* 振込先・備考 */
@@ -541,8 +655,16 @@ function ConfirmDialog({ data, onClose }) {
 /* ============================================================
    明細1行
    ============================================================ */
-function ItemRow({ item, idx, trainings, regions, onChange, onClear }) {
+function ItemRow({ item, idx, trainings, regions, onChange, onClear, calc }) {
   const set = (k) => (e) => onChange(idx, k, e.target.value);
+  const hasFee = item.fee !== "" && item.fee != null;
+  let sub = <span style={{ color: "#b0b5bd" }}>—</span>;
+  if (calc && hasFee && item.region) {
+    sub = calc.eligible
+      ? <span style={{ fontWeight: 700, color: NAVY }}>¥{fmt(calc.subsidy)}</span>
+      : <span title="この役職は、BNI福井開催のイベントだけが補助の対象です"
+              style={{ fontSize: 12, fontWeight: 700, color: RED, lineHeight: 1.3 }}>補助対象外<br />¥0</span>;
+  }
   return (
     <div className="item-row">
       <div className="cell-no" style={{ textAlign: "center", color: "#9aa0a8", fontSize: 13, fontWeight: 700 }}>
@@ -575,6 +697,10 @@ function ItemRow({ item, idx, trainings, regions, onChange, onClear }) {
         <input type="number" inputMode="numeric" min="0" step="1" placeholder="0"
                value={item.fee} onChange={set("fee")} style={{ textAlign: "right" }} />
       </div>
+      <div className="cell-sub" style={{ textAlign: "right" }}>
+        <span className="m-label">補助額</span>
+        {sub}
+      </div>
       <div className="cell-del">
         <button onClick={() => onClear(idx)} title="この行を消す"
           style={{ background: "#f3f4f6", color: "#8a8f98", borderRadius: 7, width: 36, height: 36, fontSize: 15 }}>
@@ -592,7 +718,12 @@ function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, onView,
   const members   = masters.members || [];
   const trainings = masters.trainings || [];
   const regions   = masters.regions || [];
+  const roles     = masters.roles || [];
   const member    = members.find((m) => m.id === form.memberId);
+  const role      = roleOfMember(member, roles);
+  const rate      = rateOf(masters.settings);
+  const ctx       = role ? { rate: rate, outOfPrefOk: !!role.outOfPref, regions: regions } : null;
+  const noRole    = !!member && !role;
 
   const setField = (k, v) => setForm((f) => Object.assign({}, f, { [k]: v }));
   const setItem = (idx, key, val) => setForm((f) => {
@@ -609,6 +740,7 @@ function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, onView,
 
   const filled = filledOf(form.items);
   const total  = calcTotal(form.items);
+  const subTotal = ctx ? filled.reduce((s, it) => s + itemSubsidy(it, ctx).subsidy, 0) : null;
   const p      = periodOf(form.items);
 
   const myInvoices = form.memberId
@@ -636,7 +768,7 @@ function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, onView,
             ✅ 請求書を登録しました（{saved.docNumber}）
           </div>
           <div style={{ fontSize: 14, color: "#28603f", marginBottom: 14, lineHeight: 1.8 }}>
-            合計 <b>¥{fmt(calcTotal(saved.items))}</b>／{filledOf(saved.items).length}件。
+            請求額 <b>¥{fmt(invTotal(saved))}</b>／{filledOf(saved.items).length}件。
             下のボタンからPDFを保存して保管してください。
           </div>
           {saved.numberProvisional ? (
@@ -674,7 +806,20 @@ function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, onView,
             <div>TEL：{member.tel || <span style={{ color: "#aaa" }}>未登録</span>}</div>
             <div>振込先：{member.bank || <span style={{ color: "#aaa" }}>未登録</span>}</div>
             {member.invoiceNo ? <div>登録番号：{member.invoiceNo}</div> : null}
+            <div>役職：{role ? <b>{role.name}</b> : <span style={{ color: RED, fontWeight: 700 }}>未登録</span>}</div>
+            {role ? (
+              <div>補助の範囲：{role.outOfPref
+                ? <b style={{ color: "#1b7f43" }}>県外のイベントも補助対象</b>
+                : <b style={{ color: "#8a6d00" }}>BNI福井開催のイベントのみ補助対象</b>}
+                <span style={{ ...S.tiny, marginLeft: 6 }}>（補助率 {rate}%）</span>
+              </div>
+            ) : null}
             <div style={{ ...S.tiny, marginTop: 5 }}>※ 内容が違うときは管理者に連絡してください。</div>
+          </div>
+        ) : null}
+        {noRole ? (
+          <div style={{ marginTop: 10, background: "#fdecef", border: "1.5px solid " + RED, borderRadius: 9, padding: "12px 14px", fontSize: 14, lineHeight: 1.8, color: RED, fontWeight: 700 }}>
+            ⚠️ 役職が未登録のため、登録できません。管理者へご連絡ください。
           </div>
         ) : null}
       </div>
@@ -692,12 +837,14 @@ function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, onView,
           <div>トレーニング名</div>
           <div>リージョン</div>
           <div style={{ textAlign: "right" }}>受講料金（円）</div>
+          <div style={{ textAlign: "right" }}>補助額（{rate}%）</div>
           <div></div>
         </div>
         <div style={{ border: "1px solid #e6e9ed", borderTop: "none", borderRadius: "0 0 8px 8px", overflow: "hidden" }}>
           {form.items.map((it, i) => (
             <ItemRow key={it.id} item={it} idx={i} trainings={trainings} regions={regions}
-                     onChange={setItem} onClear={clearItem} />
+                     onChange={setItem} onClear={clearItem}
+                     calc={ctx ? itemSubsidy(it, ctx) : null} />
           ))}
         </div>
 
@@ -706,7 +853,13 @@ function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, onView,
           <div style={{ flex: 1 }} />
           <div style={{ textAlign: "right" }}>
             <div style={S.tiny}>入力済み {filled.length} 件{p.from ? "／対象期間 " + fmtSlash(p.from) + " 〜 " + fmtSlash(p.to) : ""}</div>
-            <div style={{ fontSize: 22, fontWeight: 700, color: NAVY }}>合計 ¥{fmt(total)}</div>
+            <div style={{ fontSize: 13, color: "#6b7280" }}>受講料金の合計 ¥{fmt(total)}</div>
+            <div style={{ fontSize: 22, fontWeight: 700, color: NAVY }}>
+              請求額（補助額の合計） {subTotal === null
+                ? <span style={{ fontSize: 14, color: "#aaa" }}>{noRole ? "役職の登録後に表示" : "入力者を選ぶと表示"}</span>
+                : "¥" + fmt(subTotal)}
+            </div>
+            <div style={S.tiny}>補助額＝受講料金 × {rate}%（1円未満切り捨て）</div>
           </div>
         </div>
       </div>
@@ -719,8 +872,8 @@ function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, onView,
                     placeholder="補足があれば記入してください" />
         </Field>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
-          <button style={Object.assign({}, S.btn(saving ? "#b9909a" : RED), saving ? { cursor: "wait" } : null)}
-                  disabled={saving} onClick={onSave}>
+          <button style={Object.assign({}, S.btn(saving || noRole ? "#b9909a" : RED), saving ? { cursor: "wait" } : null, noRole ? { cursor: "not-allowed" } : null)}
+                  disabled={saving || noRole} onClick={onSave}>
             {saving ? "登録しています…" : "💾 この内容で請求書を登録する"}
           </button>
           <button style={S.ghost} onClick={onReset}>🧹 入力をやり直す</button>
@@ -764,7 +917,7 @@ function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, onView,
                           {pp.from ? fmtSlash(pp.from) + " 〜 " + fmtSlash(pp.to) : "—"}
                         </td>
                         <td style={{ textAlign: "center" }}>{filledOf(v.items).length}</td>
-                        <td style={{ textAlign: "right", fontWeight: 700 }}>¥{fmt(calcTotal(v.items))}</td>
+                        <td style={{ textAlign: "right", fontWeight: 700 }}>¥{fmt(invTotal(v))}</td>
                         <td style={{ whiteSpace: "nowrap" }}>
                           <button style={{ ...S.ghost, padding: "6px 12px", fontSize: 13, marginRight: 6 }} onClick={() => onView(v)}>👀 内容を見る</button>
                           <button style={{ ...S.ghost, padding: "6px 12px", fontSize: 13 }} onClick={() => onPrint(v)}>🖨 PDF</button>
@@ -800,8 +953,8 @@ function HistoryPanel({ invoices, masters, onView, onToggle }) {
     });
   }, [invoices, fMember, fStatus, fMonth]);
 
-  const sumAll    = list.reduce((s, v) => s + calcTotal(v.items), 0);
-  const sumUnpaid = list.filter((v) => (v.status || "unpaid") !== "paid").reduce((s, v) => s + calcTotal(v.items), 0);
+  const sumAll    = list.reduce((s, v) => s + invTotal(v), 0);
+  const sumUnpaid = list.filter((v) => (v.status || "unpaid") !== "paid").reduce((s, v) => s + invTotal(v), 0);
   const sumPaid   = sumAll - sumUnpaid;
 
   const months = useMemo(() => {
@@ -891,10 +1044,11 @@ function HistoryPanel({ invoices, masters, onView, onToggle }) {
                 <th style={{ width: 120 }}>状態</th>
                 <th>請求書番号</th>
                 <th>請求元</th>
+                <th>役職</th>
                 <th>請求日</th>
                 <th>対象期間</th>
                 <th style={{ textAlign: "center" }}>件数</th>
-                <th style={{ textAlign: "right" }}>合計金額</th>
+                <th style={{ textAlign: "right" }}>請求額</th>
                 <th style={{ width: 90 }}></th>
               </tr></thead>
               <tbody>
@@ -908,12 +1062,20 @@ function HistoryPanel({ invoices, masters, onView, onToggle }) {
                         {v.numberProvisional ? <span title="オフラインで登録された仮番号です。重複していないか確認してください" style={{ color: "#c07a00", marginLeft: 5 }}>⚠</span> : null}
                       </td>
                       <td style={{ whiteSpace: "nowrap" }}>{v.memberName}</td>
+                      <td style={{ whiteSpace: "nowrap", fontSize: 13 }}>
+                        {isV2(v)
+                          ? <span>{v.memberRoleName}{v.memberRoleOutOfPref ? "" : <span style={{ color: "#8a6d00" }}>（福井のみ）</span>}</span>
+                          : <span style={{ color: "#aaa" }}>旧ルール</span>}
+                      </td>
                       <td style={{ whiteSpace: "nowrap" }}>{fmtSlash(v.createdAt)}</td>
                       <td style={{ whiteSpace: "nowrap", fontSize: 13, color: "#666" }}>
                         {p.from ? fmtSlash(p.from) + " 〜 " + fmtSlash(p.to) : "—"}
                       </td>
                       <td style={{ textAlign: "center" }}>{filledOf(v.items).length}</td>
-                      <td style={{ textAlign: "right", fontWeight: 700 }}>¥{fmt(calcTotal(v.items))}</td>
+                      <td style={{ textAlign: "right", fontWeight: 700 }}>
+                        ¥{fmt(invTotal(v))}
+                        {isV2(v) ? <div style={{ fontSize: 11, color: "#8a8f98", fontWeight: 400 }}>補助率{v.rate}%</div> : null}
+                      </td>
                       <td>
                         <button style={{ ...S.ghost, padding: "6px 12px", fontSize: 13 }} onClick={() => onView(v)}>閲覧</button>
                       </td>
@@ -936,6 +1098,7 @@ function DetailModal({ inv, onClose, onPrint, onToggle, onDelete, readOnly }) {
   if (!inv) return null;
   const items = filledOf(inv.items);
   const p = periodOf(inv.items);
+  const v2 = isV2(inv);
   return (
     <div style={S.modalBg} onClick={onClose}>
       <div className="fade-in" onClick={(e) => e.stopPropagation()}
@@ -951,6 +1114,7 @@ function DetailModal({ inv, onClose, onPrint, onToggle, onDelete, readOnly }) {
           <div style={{ background: "#f7f8fa", borderRadius: 9, padding: 12, fontSize: 13, lineHeight: 1.9 }}>
             <div style={{ fontWeight: 700, color: NAVY, marginBottom: 3 }}>請求元</div>
             <div style={{ fontWeight: 700, fontSize: 15 }}>{inv.memberName}</div>
+            {v2 ? <div>役職: {inv.memberRoleName}（{inv.memberRoleOutOfPref ? "県外も補助対象" : "BNI福井開催のみ補助対象"}）</div> : null}
             <div>{inv.memberAddress || "—"}</div>
             <div>TEL: {inv.memberTel || "—"}</div>
             <div>振込先: {inv.memberBank || "—"}</div>
@@ -961,7 +1125,8 @@ function DetailModal({ inv, onClose, onPrint, onToggle, onDelete, readOnly }) {
             <div>請求日: {fmtJP(inv.createdAt)}</div>
             <div>対象期間: {p.from ? fmtJP(p.from) + " 〜 " + fmtJP(p.to) : "—"}</div>
             <div>件数: {items.length} 件</div>
-            <div style={{ fontSize: 18, fontWeight: 700, color: RED, marginTop: 3 }}>合計 ¥{fmt(calcTotal(inv.items))}</div>
+            {v2 ? <div>受講料金の合計: ¥{fmt(calcTotal(items))}（補助率 {inv.rate}%）</div> : <div style={{ color: "#8a8f98" }}>旧ルール（受講料金の全額）</div>}
+            <div style={{ fontSize: 18, fontWeight: 700, color: RED, marginTop: 3 }}>請求額 ¥{fmt(invTotal(inv))}</div>
             {inv.paidAt ? <div style={{ color: "#1b7f43" }}>支払い登録日: {fmtSlash(inv.paidAt)}</div> : null}
           </div>
         </div>
@@ -973,7 +1138,8 @@ function DetailModal({ inv, onClose, onPrint, onToggle, onDelete, readOnly }) {
               <th style={{ width: 110 }}>受講日</th>
               <th>トレーニング名</th>
               <th style={{ width: 140 }}>リージョン</th>
-              <th style={{ width: 110, textAlign: "right" }}>料金</th>
+              <th style={{ width: 110, textAlign: "right" }}>受講料金</th>
+              {v2 ? <th style={{ width: 120, textAlign: "right" }}>補助額</th> : null}
             </tr></thead>
             <tbody>
               {items.map((it, i) => (
@@ -982,7 +1148,12 @@ function DetailModal({ inv, onClose, onPrint, onToggle, onDelete, readOnly }) {
                   <td>{fmtSlash(it.date)}</td>
                   <td>{it.title}</td>
                   <td>{it.region}</td>
-                  <td style={{ textAlign: "right", fontWeight: 700 }}>¥{fmt(it.fee)}</td>
+                  <td style={{ textAlign: "right", fontWeight: v2 ? 400 : 700 }}>¥{fmt(it.fee)}</td>
+                  {v2 ? (
+                    <td style={{ textAlign: "right", fontWeight: 700 }}>
+                      {it.eligible ? "¥" + fmt(it.subsidy) : <span style={{ color: RED, fontSize: 12 }}>補助対象外 ¥0</span>}
+                    </td>
+                  ) : null}
                 </tr>
               ))}
             </tbody>
@@ -1023,16 +1194,27 @@ function DetailModal({ inv, onClose, onPrint, onToggle, onDelete, readOnly }) {
 /* ============================================================
    管理者：マスター管理
    ============================================================ */
-function SimpleListEditor({ title, hint, list, onChange }) {
+/* flagKey / flagLabel を渡すと、各行にオン・オフのチェックが付く
+   （役職マスター＝「県外も補助対象」、リージョンマスター＝「BNI福井開催」） */
+function SimpleListEditor({ title, hint, list, onChange, flagKey, flagLabel, flagOnText, flagOffText, note, onBeforeRemove }) {
   const [val, setVal] = useState("");
+  const [newFlag, setNewFlag] = useState(false);
   const [editId, setEditId] = useState(null);
   const [editVal, setEditVal] = useState("");
 
   const add = () => {
     const v = val.trim();
     if (!v) return;
-    onChange(list.concat([{ id: uid(), name: v }]));
+    const item = { id: uid(), name: v };
+    if (flagKey) item[flagKey] = !!newFlag;
+    onChange(list.concat([item]));
     setVal("");
+    setNewFlag(false);
+  };
+  const toggleFlag = (i) => {
+    const next = list.slice();
+    next[i] = Object.assign({}, next[i], { [flagKey]: !next[i][flagKey] });
+    onChange(next);
   };
   const move = (i, d) => {
     const next = list.slice();
@@ -1041,7 +1223,10 @@ function SimpleListEditor({ title, hint, list, onChange }) {
     const tmp = next[i]; next[i] = next[j]; next[j] = tmp;
     onChange(next);
   };
-  const remove = (i) => onChange(list.filter((_, k) => k !== i));
+  const remove = (i) => {
+    if (onBeforeRemove && !onBeforeRemove(list[i])) return;
+    onChange(list.filter((_, k) => k !== i));
+  };
   const commit = (i) => {
     const v = editVal.trim();
     if (v) {
@@ -1055,9 +1240,16 @@ function SimpleListEditor({ title, hint, list, onChange }) {
   return (
     <div style={S.card}>
       <div style={S.h2}>{title}<span style={{ ...S.tiny, fontWeight: 400 }}>{hint}</span></div>
-      <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+      {note ? <div style={{ ...S.tiny, lineHeight: 1.8, marginTop: -6, marginBottom: 10 }}>{note}</div> : null}
+      <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap", alignItems: "center" }}>
         <input value={val} onChange={(e) => setVal(e.target.value)} placeholder="新しく追加する名前を入力"
-               onKeyDown={(e) => { if (e.key === "Enter") add(); }} />
+               onKeyDown={(e) => { if (e.key === "Enter") add(); }} style={{ flex: "1 1 220px", width: "auto" }} />
+        {flagKey ? (
+          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, fontWeight: 700, color: "#444", whiteSpace: "nowrap" }}>
+            <input type="checkbox" checked={newFlag} onChange={(e) => setNewFlag(e.target.checked)} style={{ width: 18, height: 18 }} />
+            {flagLabel}
+          </label>
+        ) : null}
         <button style={S.btn(NAVY)} onClick={add}>＋ 追加</button>
       </div>
       {list.length === 0 ? <div style={S.tiny}>まだ登録がありません。</div> : (
@@ -1075,6 +1267,14 @@ function SimpleListEditor({ title, hint, list, onChange }) {
               ) : (
                 <React.Fragment>
                   <span style={{ flex: 1, fontSize: 14 }}>{x.name}</span>
+                  {flagKey ? (
+                    <button onClick={() => toggleFlag(i)} title={"クリックで「" + flagLabel + "」を切り替え"}
+                      style={{ borderRadius: 999, padding: "4px 12px", fontSize: 12, fontWeight: 700, whiteSpace: "nowrap",
+                               background: x[flagKey] ? "#e6f6ec" : "#f3f4f6", color: x[flagKey] ? "#1b7f43" : "#6b7280",
+                               border: "1.5px solid " + (x[flagKey] ? "#1b7f43" : "#ccd0d6") }}>
+                      {x[flagKey] ? "✅ " + flagOnText : "— " + flagOffText}
+                    </button>
+                  ) : null}
                   <button style={{ ...S.ghost, padding: "5px 9px" }} onClick={() => move(i, -1)} title="上へ">▲</button>
                   <button style={{ ...S.ghost, padding: "5px 9px" }} onClick={() => move(i, 1)} title="下へ">▼</button>
                   <button style={{ ...S.ghost, padding: "5px 11px" }} onClick={() => { setEditId(x.id); setEditVal(x.name); }}>✏</button>
@@ -1089,12 +1289,17 @@ function SimpleListEditor({ title, hint, list, onChange }) {
   );
 }
 
-function MemberEditor({ list, onChange }) {
-  const BLANK = { id: "", name: "", address: "", tel: "", bank: "", invoiceNo: "" };
+function MemberEditor({ list, onChange, roles }) {
+  const BLANK = { id: "", name: "", address: "", tel: "", bank: "", invoiceNo: "", roleId: "" };
   const [edit, setEdit] = useState(null);
+  const roleName = (m) => {
+    const r = roleOfMember(m, roles);
+    return r ? r.name : "";
+  };
 
   const save = () => {
     if (!edit.name.trim()) { alert("氏名は必ず入力してください。"); return; }
+    if (!edit.roleId) { alert("役職を選んでください。\n（役職が無い方は、入力画面で請求書を登録できません）"); return; }
     if (edit.id) {
       onChange(list.map((m) => (m.id === edit.id ? edit : m)));
     } else {
@@ -1128,6 +1333,14 @@ function MemberEditor({ list, onChange }) {
             <Field label="電話番号">
               <input value={edit.tel} onChange={(e) => setEdit(Object.assign({}, edit, { tel: e.target.value }))} placeholder="例：0776-00-0000" />
             </Field>
+            <Field label="役職（必須）" hint="選択肢は下の「役職マスター」で追加・変更できます。">
+              <select value={edit.roleId || ""} onChange={(e) => setEdit(Object.assign({}, edit, { roleId: e.target.value }))}>
+                <option value="">— 選んでください —</option>
+                {(roles || []).map((r) => (
+                  <option key={r.id} value={r.id}>{r.name}{r.outOfPref ? "（県外も補助対象）" : "（BNI福井開催のみ）"}</option>
+                ))}
+              </select>
+            </Field>
           </div>
           <Field label="住所">
             <input value={edit.address} onChange={(e) => setEdit(Object.assign({}, edit, { address: e.target.value }))} placeholder="例：〒910-0000 福井県福井市○○1-2-3" />
@@ -1155,7 +1368,13 @@ function MemberEditor({ list, onChange }) {
               <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 12px", borderBottom: i === list.length - 1 ? "none" : "1px solid #eceef1", background: i % 2 ? "#fafbfc" : "#fff", flexWrap: "wrap" }}>
                 <span style={{ width: 26, color: "#aaa", fontSize: 13 }}>{i + 1}</span>
                 <div style={{ flex: "1 1 240px", minWidth: 0 }}>
-                  <div style={{ fontWeight: 700, fontSize: 15 }}>{m.name}</div>
+                  <div style={{ fontWeight: 700, fontSize: 15 }}>
+                    {m.name}
+                    <span style={{ marginLeft: 8, fontSize: 12, fontWeight: 700, borderRadius: 999, padding: "2px 10px",
+                                   background: roleName(m) ? "#eef1f6" : "#fdecef", color: roleName(m) ? NAVY : RED }}>
+                      {roleName(m) || "役職 未登録"}
+                    </span>
+                  </div>
                   <div style={{ ...S.tiny, lineHeight: 1.7 }}>
                     {m.address || "住所未登録"}{m.tel ? "／TEL " + m.tel : ""}<br />
                     振込先：{m.bank || "未登録"}{m.invoiceNo ? "／登録番号 " + m.invoiceNo : ""}
@@ -1179,18 +1398,31 @@ function MasterPanel({ masters, setMasterKey, fbStatus }) {
   const [billTo, setBillTo]   = useState(settings.billTo || "");
   const [pw, setPw]           = useState(settings.adminPassword || "");
   const [footer, setFooter]   = useState(settings.footerNote || "");
+  const [rate, setRate]       = useState(String(rateOf(settings)));
   const [savedMsg, setSavedMsg] = useState("");
 
   useEffect(() => {
     setBillTo(settings.billTo || "");
     setPw(settings.adminPassword || "");
     setFooter(settings.footerNote || "");
-  }, [settings.billTo, settings.adminPassword, settings.footerNote]);
+    setRate(String(rateOf(settings)));
+  }, [settings.billTo, settings.adminPassword, settings.footerNote, settings.rate]);
 
   const saveSettings = () => {
-    setMasterKey("settings", { billTo: billTo, adminPassword: pw, footerNote: footer });
+    const r = Number(rate);
+    if (!(r > 0 && r <= 100)) { alert("補助率は 1〜100 の数字で入力してください。"); return; }
+    setMasterKey("settings", { billTo: billTo, adminPassword: pw, footerNote: footer, rate: r });
     setSavedMsg("保存しました");
     setTimeout(() => setSavedMsg(""), 2500);
+  };
+
+  const members = masters.members || [];
+  const confirmRoleRemove = (role) => {
+    const users = members.filter((m) => m.roleId === role.id);
+    const msg = users.length
+      ? "役職「" + role.name + "」を削除します。\n\nこの役職の入力者が " + users.length + " 名います（" + users.map((u) => u.name).join("・") + "）。\n削除すると、その方々は役職が未登録になり、請求書を登録できなくなります。\n\n本当に削除しますか？"
+      : "役職「" + role.name + "」を削除します。よろしいですか？";
+    return confirm(msg);
   };
 
   return (
@@ -1202,7 +1434,16 @@ function MasterPanel({ masters, setMasterKey, fbStatus }) {
         </div>
       </div>
 
-      <MemberEditor list={masters.members || []} onChange={(v) => setMasterKey("members", v)} />
+      <MemberEditor list={members} roles={masters.roles || []} onChange={(v) => setMasterKey("members", v)} />
+
+      <SimpleListEditor
+        title="🎖 役職マスター"
+        hint="（入力者に付ける役職と、補助の範囲）"
+        note={<span>「<b>県外も補助対象</b>」が付いた役職の方は、どのリージョンのイベントも補助の対象になります。<br />付いていない役職の方は、下のリージョンマスターで「<b>BNI福井開催</b>」が付いたイベントだけが補助の対象です。</span>}
+        list={masters.roles || []}
+        flagKey="outOfPref" flagLabel="県外も補助対象" flagOnText="県外も補助対象" flagOffText="BNI福井開催のみ"
+        onBeforeRemove={confirmRoleRemove}
+        onChange={(v) => setMasterKey("roles", v)} />
 
       <SimpleListEditor
         title="📘 トレーニング名マスター"
@@ -1213,13 +1454,19 @@ function MasterPanel({ masters, setMasterKey, fbStatus }) {
       <SimpleListEditor
         title="🗾 リージョンマスター"
         hint="（トレーニングを提供しているリージョン）"
+        note={<span>「<b>BNI福井開催</b>」が付いたリージョンのイベントは、すべての役職の方が補助の対象です。バッジを押すと切り替えられます。</span>}
         list={masters.regions || []}
+        flagKey="inPref" flagLabel="BNI福井開催" flagOnText="BNI福井開催" flagOffText="県外・他リージョン"
         onChange={(v) => setMasterKey("regions", v)} />
 
       <div style={S.card}>
         <div style={S.h2}>⚙️ 請求書と管理者の設定</div>
         <Field label="請求書の宛先">
           <input value={billTo} onChange={(e) => setBillTo(e.target.value)} placeholder="例：BNI 福井 御中" />
+        </Field>
+        <Field label="補助率（％）" hint="補助額＝受講料金 × 補助率（1円未満切り捨て）。変更は、変更後に登録する請求書から反映されます。">
+          <input type="number" inputMode="numeric" min="1" max="100" step="1" value={rate}
+                 onChange={(e) => setRate(e.target.value)} style={{ maxWidth: 160 }} />
         </Field>
         <Field label="請求書の下部に入れる文言（任意）">
           <textarea rows="2" value={footer} onChange={(e) => setFooter(e.target.value)} placeholder="例：振込手数料は貴社にてご負担ください。" />
@@ -1298,6 +1545,8 @@ function App() {
 
       // 旧バージョン（配列マスター）からの引っ越し。何度実行しても安全。
       try { await migrateMasters(d); } catch (e) { /* 引っ越しに失敗しても以降の処理は続ける */ }
+      // Ver1-006 の初期データ（役職4つ・BNI福井の印）。2回目以降は何もしない。
+      try { await migrateV6(d); } catch (e) { /* 失敗しても以降の処理は続ける */ }
       if (!alive) return;
 
       // 請求書
@@ -1387,15 +1636,19 @@ function App() {
     if (saving) return;                       // 二重クリック防止
     const member = (masters.members || []).find((m) => m.id === form.memberId);
     if (!member) { alert("「入力者（請求元）」を選んでください。"); return; }
+    const role = roleOfMember(member, masters.roles);
+    if (!role) { alert("役職が未登録のため、登録できません。\n管理者へご連絡ください。"); return; }
 
     const items = filledOf(form.items);
     if (items.length === 0) { alert("トレーニングを1件以上入力してください。"); return; }
 
-    const bad = items.filter((it) => !it.date || !it.title || !(Number(it.fee) > 0));
+    const bad = items.filter((it) => !it.date || !it.title || !it.region || !(Number(it.fee) > 0));
     if (bad.length > 0) {
-      alert("入力もれがあります。\n受講日・トレーニング名・受講料金は、入力した行すべてに必要です。\n（" + bad.length + "行）");
+      alert("入力もれがあります。\n受講日・トレーニング名・リージョン・受講料金は、入力した行すべてに必要です。\n（" + bad.length + "行）");
       return;
     }
+    const rate = rateOf(masters.settings);
+    const ctx = { rate: rate, outOfPrefOk: !!role.outOfPref, regions: masters.regions || [] };
 
     setSaving(true);
 
@@ -1425,14 +1678,26 @@ function App() {
       memberTel: member.tel || "",
       memberBank: member.bank || "",
       memberInvoiceNo: member.invoiceNo || "",
-      items: items.map((it) => ({ id: it.id, date: it.date, title: it.title, region: it.region, fee: Number(it.fee) || 0 })),
-      total: calcTotal(items),
+      // 登録した時点の役職・補助の範囲・補助率を記録（あとで役職や補助率が変わっても、この請求書は当時のまま）
+      memberRoleId: role.id,
+      memberRoleName: role.name || "",
+      memberRoleOutOfPref: !!role.outOfPref,
+      rate: rate,
+      calcVersion: 2,
+      items: items.map((it) => {
+        const c = itemSubsidy(it, ctx);
+        return { id: it.id, date: it.date, title: it.title, region: it.region, fee: Number(it.fee) || 0,
+                 inPref: isInPrefRegion(it.region, ctx.regions), eligible: c.eligible, subsidy: c.subsidy };
+      }),
+      feeTotal: calcTotal(items),
       note: form.note || "",
       status: "unpaid",
       paidAt: null,
       numberProvisional: numberProvisional,
       _ts: Date.now(),
     };
+
+    inv.total = invTotal(inv);   // 請求額（補助額の合計）
 
     const next = [inv].concat(invoices);
     setInvoices(next);
@@ -1452,8 +1717,8 @@ function App() {
     setConfirmData({
       title: toPaid ? "🟢 支払い登録" : "🔴 未払いに戻す",
       message: toPaid
-        ? (inv.memberName + " さんの請求書\n" + inv.docNumber + "（¥" + fmt(calcTotal(inv.items)) + "）を\n\n「支払い済」に登録しますか？")
-        : (inv.memberName + " さんの請求書\n" + inv.docNumber + "（¥" + fmt(calcTotal(inv.items)) + "）を\n\n「未払い」に戻しますか？"),
+        ? (inv.memberName + " さんの請求書\n" + inv.docNumber + "（¥" + fmt(invTotal(inv)) + "）を\n\n「支払い済」に登録しますか？")
+        : (inv.memberName + " さんの請求書\n" + inv.docNumber + "（¥" + fmt(invTotal(inv)) + "）を\n\n「未払い」に戻しますか？"),
       yesLabel: toPaid ? "支払い済にする" : "未払いに戻す",
       color: toPaid ? "#1b7f43" : RED,
       onYes: () => {
@@ -1471,7 +1736,7 @@ function App() {
   const deleteInvoice = (inv) => {
     setConfirmData({
       title: "🗑 請求書を削除",
-      message: inv.docNumber + "（" + inv.memberName + " さん・¥" + fmt(calcTotal(inv.items)) + "）を削除します。\n\nこの操作は元に戻せません。よろしいですか？",
+      message: inv.docNumber + "（" + inv.memberName + " さん・¥" + fmt(invTotal(inv)) + "）を削除します。\n\nこの操作は元に戻せません。よろしいですか？",
       yesLabel: "削除する",
       color: RED,
       onYes: () => {
