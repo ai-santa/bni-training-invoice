@@ -89,7 +89,7 @@ const { useState, useEffect, useMemo } = React;
    ・管理者：パスワードで入り、履歴の閲覧と「未払い／支払い済」管理
    ============================================================ */
 
-const APP_VERSION = "Ver1-006";
+const APP_VERSION = "Ver1-007";
 
 /* ------------------------------------------------------------
    ★ 管理者パスワードの初期値（マスター管理画面から変更できます）
@@ -127,6 +127,7 @@ const COL = {
   trainings: "bni_trainings",
   regions:   "bni_regions",
   roles:     "bni_roles",     // 役職マスター（Ver1-006〜）
+  drafts:    "bni_drafts",    // 途中保存（下書き）。ドキュメントID＝入力者ID（1人1件）（Ver1-007〜）
 };
 const MASTER_KEYS = ["members", "trainings", "regions", "roles"];
 
@@ -210,6 +211,7 @@ const EMPTY_MASTERS = () => ({
 const EMPTY_FORM = () => ({
   id: null, docNumber: "", createdAt: todayStr(), memberId: "",
   items: BLANK_ITEMS(10), note: "", status: "unpaid", paidAt: null,
+  loadedDraftOf: null,   // いま画面に開いている途中保存が「誰の分か」（入力者ID）
 });
 
 const isFilled  = (it) => !!(it.date || it.title || it.region || (it.fee !== "" && it.fee != null));
@@ -253,6 +255,36 @@ function invTotal(inv) {
 function periodOf(items) {
   const ds = (items || []).map((i) => i.date).filter(Boolean).sort();
   return ds.length ? { from: ds[0], to: ds[ds.length - 1] } : { from: "", to: "" };
+}
+/* ------------------------------------------------------------
+   途中保存（下書き）（Ver1-007〜）
+   ・「途中保存」ボタンを押したときだけ保存（自動保存はしない）
+   ・1人につき1件（ドキュメントID＝入力者ID）。請求書番号は取らない
+   ・保存のたびに「日時・件数・受講料金・その時点の請求額」を履歴に残す（最新20回分）
+   ・請求書を登録（提出）したら、その人の下書きは片付ける
+   ------------------------------------------------------------ */
+const DRAFT_HISTORY_MAX = 20;
+function fmtDT(iso, withYear) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "—";
+  const hm = pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+  return withYear
+    ? d.getFullYear() + "/" + pad2(d.getMonth() + 1) + "/" + pad2(d.getDate()) + " " + hm
+    : (d.getMonth() + 1) + "/" + d.getDate() + " " + hm;
+}
+// 下書きの明細を入力画面の形に戻す（最低10行にそろえる）
+function padItems(items) {
+  const arr = (items || []).map((it) => Object.assign(EMPTY_ITEM(), it));
+  while (arr.length < 10) arr.push(EMPTY_ITEM());
+  return arr;
+}
+// 下書きの「現時点の請求額」＝いまの役職・補助率で計算（役職が未登録なら null）
+function draftSubsidy(items, member, masters) {
+  const role = roleOfMember(member, masters.roles);
+  if (!role) return null;
+  const ctx = { rate: rateOf(masters.settings), outOfPrefOk: !!role.outOfPref, regions: masters.regions || [] };
+  return filledOf(items).reduce((s, it) => s + itemSubsidy(it, ctx).subsidy, 0);
 }
 function docPrefix(dateStr) {
   return "BNI-" + String(dateStr).replace(/-/g, "") + "-";
@@ -425,7 +457,7 @@ function csvSummary(list) {
 }
 
 /* localStorage（オフライン時の予備・クラウドが本命） */
-const LS = { invoices: "bni_invoices_v1", masters: "bni_masters_v1" };
+const LS = { invoices: "bni_invoices_v1", masters: "bni_masters_v1", drafts: "bni_drafts_v1" };
 function loadLS(key, fallback) {
   try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; }
   catch (e) { return fallback; }
@@ -714,7 +746,41 @@ function ItemRow({ item, idx, trainings, regions, onChange, onClear, calc }) {
 /* ============================================================
    入力画面（受講者用）
    ============================================================ */
-function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, onView, saved, saving, onReset, fbStatus }) {
+/* 途中保存の履歴（最新20回分）の表。受講者・管理者の両方で使う */
+function DraftHistoryTable({ history }) {
+  const list = history || [];
+  if (list.length === 0) return <div style={S.tiny}>まだ履歴がありません。</div>;
+  return (
+    <div className="tbl-wrap">
+      <table className="hist" style={{ minWidth: 460 }}>
+        <thead><tr>
+          <th style={{ width: 44, textAlign: "center" }}>回</th>
+          <th>保存した日時</th>
+          <th style={{ textAlign: "center" }}>件数</th>
+          <th style={{ textAlign: "right" }}>受講料金の合計</th>
+          <th style={{ textAlign: "right" }}>その時点の請求額</th>
+        </tr></thead>
+        <tbody>
+          {list.map((h, i) => (
+            <tr key={h.at + "-" + i}>
+              <td style={{ textAlign: "center", color: "#999" }}>{h.n || ""}</td>
+              <td style={{ whiteSpace: "nowrap" }}>{fmtDT(h.at, true)}</td>
+              <td style={{ textAlign: "center" }}>{h.count}</td>
+              <td style={{ textAlign: "right" }}>¥{fmt(h.fee)}</td>
+              <td style={{ textAlign: "right", fontWeight: 700 }}>
+                {h.subsidy == null ? <span style={{ color: "#aaa", fontWeight: 400, fontSize: 12 }}>役職未登録</span> : "¥" + fmt(h.subsidy)}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, onView, saved, saving, onReset, fbStatus,
+                      onSelectMember, onSaveDraft, savingDraft, draft, draftMsg }) {
+  const [showHist, setShowHist] = useState(false);
   const members   = masters.members || [];
   const trainings = masters.trainings || [];
   const regions   = masters.regions || [];
@@ -748,6 +814,8 @@ function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, onView,
     : [];
 
   const noMaster = members.length === 0;
+  // 途中保存できない場面：入力者が未選択／保存中／提出した直後（同じ人の内容がまだ画面に残っている）
+  const draftOff = !form.memberId || savingDraft || !!(saved && saved.memberId === form.memberId);
 
   return (
     <div>
@@ -790,7 +858,7 @@ function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, onView,
         <div style={S.h2}>① あなた（請求元）を選んでください</div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(240px,1fr))", gap: 14 }}>
           <Field label="入力者（請求元）">
-            <select value={form.memberId} onChange={(e) => setField("memberId", e.target.value)}>
+            <select value={form.memberId} onChange={(e) => onSelectMember(e.target.value)}>
               <option value="">— 選んでください —</option>
               {members.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
             </select>
@@ -799,6 +867,12 @@ function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, onView,
             <input type="date" value={form.createdAt} onChange={(e) => setField("createdAt", e.target.value)} />
           </Field>
         </div>
+        {draft && form.loadedDraftOf === form.memberId ? (
+          <div className="fade-in" style={{ background: "#eef4ff", border: "1.5px solid #5b7fc7", borderRadius: 9, padding: "10px 14px", fontSize: 14, lineHeight: 1.8, color: "#1f3864", marginBottom: 12 }}>
+            📝 <b>前回の途中保存の続き</b>を開いています
+            <span style={{ fontSize: 13, color: "#4a5a7a", marginLeft: 6 }}>（最終保存：{fmtDT(draft.updatedAt)}・保存{draft.savedCount || 1}回目）</span>
+          </div>
+        ) : null}
         {member ? (
           <div style={{ background: "#f7f8fa", borderRadius: 9, padding: "12px 14px", fontSize: 13, lineHeight: 1.9, color: "#444" }}>
             <div style={{ fontWeight: 700, color: NAVY, marginBottom: 3 }}>請求書に載る情報（マスター登録内容）</div>
@@ -872,6 +946,12 @@ function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, onView,
                     placeholder="補足があれば記入してください" />
         </Field>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+          <button style={Object.assign({}, S.ghost, { color: "#2c4f9e", borderColor: "#5b7fc7", borderWidth: 1.5 },
+                                       draftOff ? { opacity: 0.5, cursor: "not-allowed" } : null, savingDraft ? { cursor: "wait" } : null)}
+                  disabled={draftOff} onClick={onSaveDraft}
+                  title={!form.memberId ? "先に①で入力者を選んでください" : ""}>
+            {savingDraft ? "保存しています…" : "💾 途中保存（提出しない）"}
+          </button>
           <button style={Object.assign({}, S.btn(saving || noRole ? "#b9909a" : RED), saving ? { cursor: "wait" } : null, noRole ? { cursor: "not-allowed" } : null)}
                   disabled={saving || noRole} onClick={onSave}>
             {saving ? "登録しています…" : "💾 この内容で請求書を登録する"}
@@ -882,6 +962,37 @@ function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, onView,
             {fbStatus === "online" ? "☁ クラウド保存できます" : "⚠ オフライン：この端末にだけ保存されます"}
           </span>
         </div>
+        {draftMsg ? (
+          <div className="fade-in" style={{ marginTop: 10, color: "#1b7f43", fontWeight: 700, fontSize: 14 }}>✅ {draftMsg}</div>
+        ) : null}
+        <div style={{ ...S.tiny, marginTop: 10, lineHeight: 1.8 }}>
+          ・<b>途中保存</b>＝まだ提出しません（請求書番号は付きません）。次に名前を選ぶと、続きから再開できます。<br />
+          ・<b>請求書を登録</b>＝提出です。請求書番号が付き、途中保存の内容は片付けられます。
+        </div>
+
+        {/* 途中保存の状況と履歴 */}
+        {draft ? (
+          <div style={{ marginTop: 12, background: "#f4f7fd", border: "1px solid #d5def0", borderRadius: 9, padding: "10px 14px" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+              <span style={{ fontSize: 14, fontWeight: 700, color: NAVY }}>
+                📝 最終保存：{fmtDT(draft.updatedAt)}（保存{draft.savedCount || 1}回目）
+              </span>
+              <span style={{ fontSize: 13, color: "#555" }}>
+                {filledOf(draft.items).length}件／受講料金 ¥{fmt(calcTotal(draft.items))}
+              </span>
+              <div style={{ flex: 1 }} />
+              <button style={{ ...S.ghost, padding: "5px 12px", fontSize: 13 }} onClick={() => setShowHist(!showHist)}>
+                {showHist ? "▲ 履歴を閉じる" : "🕘 保存の履歴を見る（" + (draft.history || []).length + "）"}
+              </button>
+            </div>
+            {showHist ? (
+              <div style={{ marginTop: 10 }}>
+                <DraftHistoryTable history={draft.history} />
+                <div style={{ ...S.tiny, marginTop: 6 }}>※ 最新{DRAFT_HISTORY_MAX}回分まで残ります。</div>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
       </div>
 
       {/* 自分の過去の請求書 */}
@@ -1086,6 +1197,174 @@ function HistoryPanel({ invoices, masters, onView, onToggle }) {
             </table>
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   管理者：申請の進捗（途中保存＝下書き）（Ver1-007〜）
+   ・提出済みの請求書とは別扱い（請求書番号はまだ無い）
+   ・「現時点の請求額」は、いまの役職・補助率で計算した見込み
+   ============================================================ */
+function DraftPanel({ drafts, masters, onView }) {
+  const members = masters.members || [];
+  const rows = (drafts || []).map((d) => {
+    const member = members.find((m) => m.id === d.memberId) || null;
+    const role = roleOfMember(member, masters.roles);
+    return {
+      d: d,
+      name: (member && member.name) || d.memberName || "（削除された入力者）",
+      roleName: role ? role.name : "",
+      count: filledOf(d.items).length,
+      fee: calcTotal(d.items),
+      sub: draftSubsidy(d.items, member, masters),
+      p: periodOf(d.items),
+    };
+  }).sort((a, b) => String(b.d.updatedAt || "").localeCompare(String(a.d.updatedAt || "")));
+
+  const sumSub   = rows.reduce((s, r) => s + (r.sub || 0), 0);
+  const sumCount = rows.reduce((s, r) => s + r.count, 0);
+  const Tile = ({ label, value, color, bg }) => (
+    <div style={{ background: bg, borderRadius: 10, padding: "14px 16px", flex: "1 1 180px", minWidth: 160 }}>
+      <div style={{ fontSize: 12, fontWeight: 700, color: "#6b7280", marginBottom: 4 }}>{label}</div>
+      <div style={{ fontSize: 21, fontWeight: 700, color: color }}>{value}</div>
+    </div>
+  );
+
+  return (
+    <div>
+      <div style={{ ...S.card, background: "#eef1f6" }}>
+        <div style={{ fontSize: 14, lineHeight: 1.9, color: "#3a4252" }}>
+          入力者が「<b>途中保存</b>」した、<b>まだ提出されていない申請</b>の一覧です。<br />
+          請求書番号はまだ付いていません。本人が「請求書を登録」すると、ここから消えて「📚 履歴・支払い管理」に移ります。
+        </div>
+      </div>
+
+      <div style={S.card}>
+        <div style={S.h2}>📊 途中経過のまとめ<span style={{ ...S.tiny, fontWeight: 400 }}>（請求額は、いまの役職・補助率で計算した見込み）</span></div>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          <Tile label="途中保存している人" value={rows.length + " 名"} color={NAVY} bg="#f2f4f7" />
+          <Tile label="入力済みのトレーニング" value={sumCount + " 件"} color={NAVY} bg="#f2f4f7" />
+          <Tile label="現時点の請求額（見込み）" value={"¥" + fmt(sumSub)} color="#2c4f9e" bg="#eef4ff" />
+        </div>
+      </div>
+
+      <div style={S.card}>
+        <div style={S.h2}>📝 申請の進捗（下書き）</div>
+        {rows.length === 0 ? (
+          <div style={S.tiny}>途中保存している方はいません。</div>
+        ) : (
+          <div className="tbl-wrap">
+            <table className="hist">
+              <thead><tr>
+                <th>氏名</th>
+                <th>役職</th>
+                <th>対象期間</th>
+                <th style={{ textAlign: "center" }}>件数</th>
+                <th style={{ textAlign: "right" }}>受講料金</th>
+                <th style={{ textAlign: "right" }}>現時点の請求額</th>
+                <th>最終保存</th>
+                <th style={{ textAlign: "center" }}>保存回数</th>
+                <th style={{ width: 90 }}></th>
+              </tr></thead>
+              <tbody>
+                {rows.map((r) => (
+                  <tr key={r.d.memberId}>
+                    <td style={{ whiteSpace: "nowrap", fontWeight: 700 }}>{r.name}</td>
+                    <td style={{ whiteSpace: "nowrap", fontSize: 13 }}>{r.roleName || <span style={{ color: RED }}>未登録</span>}</td>
+                    <td style={{ whiteSpace: "nowrap", fontSize: 13, color: "#666" }}>
+                      {r.p.from ? fmtSlash(r.p.from) + " 〜 " + fmtSlash(r.p.to) : "—"}
+                    </td>
+                    <td style={{ textAlign: "center" }}>{r.count}</td>
+                    <td style={{ textAlign: "right", color: "#555" }}>¥{fmt(r.fee)}</td>
+                    <td style={{ textAlign: "right", fontWeight: 700 }}>
+                      {r.sub == null ? <span style={{ color: "#aaa", fontWeight: 400, fontSize: 12 }}>役職の登録後に表示</span> : "¥" + fmt(r.sub)}
+                    </td>
+                    <td style={{ whiteSpace: "nowrap" }}>{fmtDT(r.d.updatedAt, true)}</td>
+                    <td style={{ textAlign: "center" }}>{r.d.savedCount || 1}回</td>
+                    <td>
+                      <button style={{ ...S.ghost, padding: "6px 12px", fontSize: 13 }} onClick={() => onView(r.d)}>閲覧</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DraftModal({ draft, masters, onClose }) {
+  if (!draft) return null;
+  const member = (masters.members || []).find((m) => m.id === draft.memberId) || null;
+  const role = roleOfMember(member, masters.roles);
+  const rate = rateOf(masters.settings);
+  const ctx = role ? { rate: rate, outOfPrefOk: !!role.outOfPref, regions: masters.regions || [] } : null;
+  const items = filledOf(draft.items);
+  const p = periodOf(items);
+  const sub = draftSubsidy(items, member, masters);
+  return (
+    <div style={S.modalBg} onClick={onClose}>
+      <div className="fade-in" onClick={(e) => e.stopPropagation()}
+        style={{ background: "#fff", borderRadius: 14, width: "100%", maxWidth: 820, maxHeight: "90vh", overflowY: "auto", padding: 22 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 14, flexWrap: "wrap" }}>
+          <div style={{ fontSize: 18, fontWeight: 700, color: NAVY }}>📝 {(member && member.name) || draft.memberName} さんの途中保存</div>
+          <span style={{ background: "#eef4ff", color: "#2c4f9e", border: "1.5px solid #5b7fc7", borderRadius: 999, padding: "4px 12px", fontSize: 12, fontWeight: 700 }}>未提出</span>
+          <div style={{ flex: 1 }} />
+          <button style={S.ghost} onClick={onClose}>✕ 閉じる</button>
+        </div>
+
+        <div style={{ background: "#f7f8fa", borderRadius: 9, padding: 12, fontSize: 13, lineHeight: 1.9, marginBottom: 14 }}>
+          <div>役職: {role ? role.name + "（" + (role.outOfPref ? "県外も補助対象" : "BNI福井開催のみ補助対象") + "）" : <span style={{ color: RED, fontWeight: 700 }}>未登録</span>}</div>
+          <div>対象期間: {p.from ? fmtJP(p.from) + " 〜 " + fmtJP(p.to) : "—"}／{items.length} 件</div>
+          <div>受講料金の合計: ¥{fmt(calcTotal(items))}（補助率 {rate}%）</div>
+          <div style={{ fontSize: 17, fontWeight: 700, color: "#2c4f9e", marginTop: 3 }}>
+            現時点の請求額（見込み） {sub == null ? <span style={{ fontSize: 13, color: "#aaa" }}>役職の登録後に表示</span> : "¥" + fmt(sub)}
+          </div>
+          <div style={S.tiny}>最終保存 {fmtDT(draft.updatedAt, true)}（保存{draft.savedCount || 1}回目）</div>
+        </div>
+
+        <div className="tbl-wrap" style={{ marginBottom: 14 }}>
+          <table className="hist" style={{ minWidth: 620 }}>
+            <thead><tr>
+              <th style={{ width: 40, textAlign: "center" }}>No</th>
+              <th style={{ width: 110 }}>受講日</th>
+              <th>トレーニング名</th>
+              <th style={{ width: 140 }}>リージョン</th>
+              <th style={{ width: 110, textAlign: "right" }}>受講料金</th>
+              <th style={{ width: 120, textAlign: "right" }}>補助額</th>
+            </tr></thead>
+            <tbody>
+              {items.map((it, i) => {
+                const c = ctx ? itemSubsidy(it, ctx) : null;
+                return (
+                  <tr key={it.id || i}>
+                    <td style={{ textAlign: "center", color: "#999" }}>{i + 1}</td>
+                    <td>{it.date ? fmtSlash(it.date) : <span style={{ color: "#c07a00" }}>未入力</span>}</td>
+                    <td>{it.title || <span style={{ color: "#c07a00" }}>未入力</span>}</td>
+                    <td>{it.region || <span style={{ color: "#c07a00" }}>未入力</span>}</td>
+                    <td style={{ textAlign: "right" }}>{it.fee !== "" && it.fee != null ? "¥" + fmt(it.fee) : <span style={{ color: "#c07a00" }}>未入力</span>}</td>
+                    <td style={{ textAlign: "right", fontWeight: 700 }}>
+                      {!c ? "—" : (c.eligible ? "¥" + fmt(c.subsidy) : <span style={{ color: RED, fontSize: 12 }}>補助対象外 ¥0</span>)}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+
+        {draft.note ? (
+          <div style={{ background: "#f7f8fa", borderRadius: 9, padding: 12, fontSize: 13, marginBottom: 14, whiteSpace: "pre-wrap" }}>
+            <b style={{ color: NAVY }}>備考：</b>{draft.note}
+          </div>
+        ) : null}
+
+        <div style={{ fontSize: 14, fontWeight: 700, color: NAVY, marginBottom: 8 }}>🕘 保存の履歴（最新{DRAFT_HISTORY_MAX}回分）</div>
+        <DraftHistoryTable history={draft.history} />
       </div>
     </div>
   );
@@ -1517,6 +1796,7 @@ function AdminGate({ expected, onOk, onClose }) {
 function App() {
   const [masters,  setMasters]  = useState(() => loadLS(LS.masters, EMPTY_MASTERS()));
   const [invoices, setInvoices] = useState(() => loadLS(LS.invoices, []));
+  const [drafts,   setDrafts]   = useState(() => loadLS(LS.drafts, []));
   const [fbStatus, setFbStatus] = useState("connecting");
   const [db, setDb]             = useState(null);
 
@@ -1528,6 +1808,9 @@ function App() {
   const [saved, setSaved]       = useState(null);
   const [saving, setSaving]     = useState(false);
   const [viewInv, setViewInv]   = useState(null);
+  const [viewDraft, setViewDraft] = useState(null);
+  const [savingDraft, setSavingDraft] = useState(false);
+  const [draftMsg, setDraftMsg] = useState("");
   const [printHTML, setPrintHTML] = useState(null);
   const [confirmData, setConfirmData] = useState(null);
 
@@ -1555,6 +1838,16 @@ function App() {
           const arr = snap.docs.map((x) => Object.assign({}, x.data(), { _fbId: x.id }));
           setInvoices(sortByTsDesc(arr));
           saveLS(LS.invoices, arr);
+        },
+        () => setFbStatus("offline")
+      ));
+
+      // 途中保存（下書き）。ドキュメントID＝入力者ID
+      unsubs.push(d.collection(COL.drafts).onSnapshot(
+        (snap) => {
+          const arr = snap.docs.map((x) => Object.assign({}, x.data(), { memberId: x.id }));
+          setDrafts(arr);
+          saveLS(LS.drafts, arr);
         },
         () => setFbStatus("offline")
       ));
@@ -1629,6 +1922,77 @@ function App() {
     prev.forEach((item) => {
       if (!nextIds[item.id]) coll.doc(item.id).delete().catch(() => setFbStatus("offline"));
     });
+  };
+
+  /* --- 入力者を選ぶ（途中保存があれば続きを開く） --- */
+  const selectMember = (id) => {
+    const d = id ? drafts.find((x) => x.memberId === id) : null;
+    const hasInput = filledOf(form.items).length > 0 || !!String(form.note || "").trim();
+    // 別の人の途中保存を開いたまま名前を切り替えた → その人の内容は持ち越さない（クラウドに残っているので消えない）
+    const fromOtherDraft = !!form.loadedDraftOf && form.loadedDraftOf !== id;
+
+    if (d) {
+      const open = !hasInput || fromOtherDraft || confirm(
+        "この方には途中保存があります（" + fmtDT(d.updatedAt) + "・" + filledOf(d.items).length + "件）。\n\n"
+        + "［OK］途中保存の続きを開く（いま画面に入力した内容は消えます）\n"
+        + "［キャンセル］いま画面に入力した内容のまま進める");
+      if (open) {
+        setForm((f) => Object.assign({}, f, { memberId: id, items: padItems(d.items), note: d.note || "", loadedDraftOf: id }));
+      } else {
+        setForm((f) => Object.assign({}, f, { memberId: id, loadedDraftOf: null }));
+      }
+      return;
+    }
+    if (fromOtherDraft) {
+      setForm((f) => Object.assign({}, f, { memberId: id, items: BLANK_ITEMS(10), note: "", loadedDraftOf: null }));
+      return;
+    }
+    setForm((f) => Object.assign({}, f, { memberId: id }));
+  };
+
+  /* --- 途中保存（提出しない・請求書番号は取らない） ---
+     1人1件。保存のたびに履歴へ「日時・件数・受講料金・その時点の請求額」を積む（最新20回分）。
+     役職が未登録でも保存できる（提出のときだけ役職が必須）。 */
+  const saveDraft = async () => {
+    if (savingDraft) return;
+    const member = (masters.members || []).find((m) => m.id === form.memberId);
+    if (!member) { alert("「入力者（請求元）」を選んでください。"); return; }
+    const items = filledOf(form.items).map((it) => ({
+      id: it.id, date: it.date || "", title: it.title || "", region: it.region || "",
+      fee: (it.fee === "" || it.fee == null) ? "" : String(it.fee),
+    }));
+    if (items.length === 0 && !String(form.note || "").trim()) {
+      alert("保存する内容がありません。\nトレーニングを1件以上入力してから途中保存してください。");
+      return;
+    }
+
+    setSavingDraft(true);
+    const prev = drafts.find((x) => x.memberId === member.id) || null;
+    const now = new Date().toISOString();
+    const count = (prev && prev.savedCount ? prev.savedCount : 0) + 1;
+    const entry = { n: count, at: now, count: items.length, fee: calcTotal(items), subsidy: draftSubsidy(items, member, masters) };
+    const draft = {
+      memberId: member.id,
+      memberName: member.name || "",
+      items: items,
+      note: form.note || "",
+      firstSavedAt: (prev && prev.firstSavedAt) || now,
+      updatedAt: now,
+      savedCount: count,
+      history: [entry].concat((prev && prev.history) || []).slice(0, DRAFT_HISTORY_MAX),
+    };
+
+    const next = drafts.filter((x) => x.memberId !== member.id).concat([draft]);
+    setDrafts(next);
+    saveLS(LS.drafts, next);
+    setForm((f) => Object.assign({}, f, { loadedDraftOf: member.id }));
+    if (db) {
+      try { await db.collection(COL.drafts).doc(member.id).set(stripUndefined(draft)); }
+      catch (e) { setFbStatus("offline"); }
+    }
+    setSavingDraft(false);
+    setDraftMsg("途中保存しました（" + fmtDT(now) + "・保存" + count + "回目）。まだ提出はされていません。");
+    setTimeout(() => setDraftMsg(""), 5000);
   };
 
   /* --- 請求書の保存 --- */
@@ -1706,6 +2070,14 @@ function App() {
       try { await db.collection(COL.invoices).doc(inv.id).set(stripUndefined(inv)); }
       catch (e) { setFbStatus("offline"); }
     }
+    // 提出したので、この人の途中保存は片付ける
+    if (drafts.some((x) => x.memberId === member.id)) {
+      const nd = drafts.filter((x) => x.memberId !== member.id);
+      setDrafts(nd);
+      saveLS(LS.drafts, nd);
+      if (db) db.collection(COL.drafts).doc(member.id).delete().catch(() => setFbStatus("offline"));
+    }
+    setDraftMsg("");
     setSaved(inv);
     setSaving(false);
     window.scrollTo({ top: 0, behavior: "smooth" });
@@ -1801,6 +2173,7 @@ function App() {
           <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
             <TabBtn id="entry" label="📝 請求書を入力する" />
             {isAdmin ? <TabBtn id="history" label="📚 履歴・支払い管理" /> : null}
+            {isAdmin ? <TabBtn id="drafts" label={"📝 申請の進捗（下書き）" + (drafts.length ? " " + drafts.length : "")} /> : null}
             {isAdmin ? <TabBtn id="master" label="⚙️ マスター管理" /> : null}
           </div>
         </div>
@@ -1812,10 +2185,16 @@ function App() {
         {tab === "entry" ? (
           <EntryPanel form={form} setForm={setForm} masters={masters} invoices={invoices}
                       onSave={saveInvoice} onPrint={printInvoice} onView={setViewInv} saved={saved}
-                      saving={saving} onReset={resetForm} fbStatus={fbStatus} />
+                      saving={saving} onReset={resetForm} fbStatus={fbStatus}
+                      onSelectMember={selectMember} onSaveDraft={saveDraft} savingDraft={savingDraft}
+                      draft={form.memberId ? drafts.find((x) => x.memberId === form.memberId) || null : null}
+                      draftMsg={draftMsg} />
         ) : null}
         {tab === "history" && isAdmin ? (
           <HistoryPanel invoices={invoices} masters={masters} onView={setViewInv} onToggle={toggleStatus} />
+        ) : null}
+        {tab === "drafts" && isAdmin ? (
+          <DraftPanel drafts={drafts} masters={masters} onView={setViewDraft} />
         ) : null}
         {tab === "master" && isAdmin ? (
           <MasterPanel masters={masters} setMasterKey={setMasterKey} fbStatus={fbStatus} />
@@ -1832,6 +2211,8 @@ function App() {
       <DetailModal inv={viewInv} onClose={() => setViewInv(null)} onPrint={printInvoice}
                    onToggle={toggleStatus} onDelete={deleteInvoice}
                    readOnly={!isAdmin || tab === "entry"} />
+
+      <DraftModal draft={viewDraft} masters={masters} onClose={() => setViewDraft(null)} />
 
       <ConfirmDialog data={confirmData} onClose={() => setConfirmData(null)} />
 
