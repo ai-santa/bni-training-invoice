@@ -89,7 +89,7 @@ const { useState, useEffect, useMemo } = React;
    ・管理者：パスワードで入り、履歴の閲覧と「未払い／支払い済」管理
    ============================================================ */
 
-const APP_VERSION = "Ver1-008";
+const APP_VERSION = "Ver1-009";
 
 /* ------------------------------------------------------------
    ★ 管理者パスワードの初期値（マスター管理画面から変更できます）
@@ -622,7 +622,8 @@ function buildInvoiceHTML(inv, settings) {
 + '<div style="display:flex;gap:14px;margin-top:16px;">'
 +   '<div style="flex:1;border:1px solid #c9ced6;border-radius:4px;padding:10px 12px;">'
 +     '<div style="font-size:0.72rem;font-weight:700;color:' + NAVY + ';margin-bottom:4px;">お振込先</div>'
-+     '<div style="font-size:0.8rem;line-height:1.7;white-space:pre-wrap;">' + (inv.memberBank ? escBr(inv.memberBank) : '<span style="color:#aaa;">（未登録）</span>') + '</div>'
+/* 振込先は個人情報のためPDFには載せない（Ver1-009〜）。口座は管理画面でのみ確認できる */
++     '<div style="font-size:0.8rem;line-height:1.7;white-space:pre-wrap;">' + (String(inv.memberBank || "").trim() ? '事務局に登録済み' : '<span style="color:#aaa;">（未登録）</span>') + '</div>'
 +   '</div>'
 +   '<div style="flex:1;border:1px solid #c9ced6;border-radius:4px;padding:10px 12px;">'
 +     '<div style="font-size:0.72rem;font-weight:700;color:' + NAVY + ';margin-bottom:4px;">備考</div>'
