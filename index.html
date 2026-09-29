@@ -89,7 +89,7 @@ const { useState, useEffect, useMemo } = React;
    ・管理者：パスワードで入り、履歴の閲覧と「未払い／支払い済」管理
    ============================================================ */
 
-const APP_VERSION = "Ver1-007";
+const APP_VERSION = "Ver1-008";
 
 /* ------------------------------------------------------------
    ★ 管理者パスワードの初期値（マスター管理画面から変更できます）
@@ -656,6 +656,19 @@ function StatusBadge({ status, onClick, small }) {
   );
 }
 
+/* 振込先の伏せ字表示（Ver1-008〜）
+   入力画面では、他の人の名前を選んでも口座情報が見えないように「＊＊＊」で隠す。
+   中身は、パスワードで入る管理画面（履歴の「閲覧」・マスター管理・CSV）でだけ確認できる。 */
+function BankMasked({ bank }) {
+  if (!String(bank || "").trim()) return <span style={{ color: "#aaa" }}>未登録</span>;
+  return (
+    <span>
+      <span style={{ letterSpacing: "0.15em" }}>＊＊＊＊＊＊</span>
+      <span style={{ fontSize: 12, color: "#8a8f98", marginLeft: 6 }}>（登録済み・管理者のみ確認できます）</span>
+    </span>
+  );
+}
+
 function Field({ label, children, hint }) {
   return (
     <div style={{ marginBottom: 12 }}>
@@ -878,7 +891,7 @@ function EntryPanel({ form, setForm, masters, invoices, onSave, onPrint, onView,
             <div style={{ fontWeight: 700, color: NAVY, marginBottom: 3 }}>請求書に載る情報（マスター登録内容）</div>
             <div>住所：{member.address || <span style={{ color: "#aaa" }}>未登録</span>}</div>
             <div>TEL：{member.tel || <span style={{ color: "#aaa" }}>未登録</span>}</div>
-            <div>振込先：{member.bank || <span style={{ color: "#aaa" }}>未登録</span>}</div>
+            <div>振込先：<BankMasked bank={member.bank} /></div>
             {member.invoiceNo ? <div>登録番号：{member.invoiceNo}</div> : null}
             <div>役職：{role ? <b>{role.name}</b> : <span style={{ color: RED, fontWeight: 700 }}>未登録</span>}</div>
             {role ? (
@@ -1396,7 +1409,7 @@ function DetailModal({ inv, onClose, onPrint, onToggle, onDelete, readOnly }) {
             {v2 ? <div>役職: {inv.memberRoleName}（{inv.memberRoleOutOfPref ? "県外も補助対象" : "BNI福井開催のみ補助対象"}）</div> : null}
             <div>{inv.memberAddress || "—"}</div>
             <div>TEL: {inv.memberTel || "—"}</div>
-            <div>振込先: {inv.memberBank || "—"}</div>
+            <div>振込先: {readOnly ? <BankMasked bank={inv.memberBank} /> : (inv.memberBank || "—")}</div>
             {inv.memberInvoiceNo ? <div>登録番号: {inv.memberInvoiceNo}</div> : null}
           </div>
           <div style={{ background: "#f7f8fa", borderRadius: 9, padding: 12, fontSize: 13, lineHeight: 1.9 }}>
